@@ -4,7 +4,6 @@ use crate::{
     api::{Eth, Namespace},
     confirm,
     contract::tokens::{Detokenize, Tokenize},
-    futures::Future,
     types::{
         Address, BlockId, Bytes, CallRequest, FilterBuilder, TransactionCondition, TransactionReceipt,
         TransactionRequest, H256, U256,
@@ -203,50 +202,31 @@ impl<T: Transport> Contract<T> {
     }
 
     /// Call constant function
-    pub fn query<R, A, B, P>(
-        &self,
-        func: &str,
-        params: P,
-        from: A,
-        options: Options,
-        block: B,
-    ) -> impl Future<Output = Result<R>> + '_
+    pub async fn query<R, A, B, P>(&self, func: &str, params: P, from: A, options: Options, block: B) -> Result<R>
     where
         R: Detokenize,
         A: Into<Option<Address>>,
         B: Into<Option<BlockId>>,
         P: Tokenize,
     {
-        let result = self
-            .abi
-            .function(func)
-            .and_then(|function| {
-                function
-                    .encode_input(&params.into_tokens())
-                    .map(|call| (call, function))
-            })
-            .map(|(call, function)| {
-                let call_future = self.eth.call(
-                    CallRequest {
-                        from: from.into(),
-                        to: Some(self.address),
-                        gas: options.gas,
-                        gas_price: options.gas_price,
-                        value: options.value,
-                        data: Some(Bytes(call)),
-                    },
-                    block.into(),
-                );
-                (call_future, function)
-            });
-        // NOTE for the batch transport to work correctly, we must call `transport.execute` without ever polling the future,
-        // hence it cannot be a fully `async` function.
-        async {
-            let (call_future, function) = result?;
-            let bytes = call_future.await?;
-            let output = function.decode_output(&bytes.0)?;
-            R::from_tokens(output)
-        }
+        let function = self.abi.function(func)?;
+        let call = function.encode_input(&params.into_tokens())?;
+        let bytes = self
+            .eth
+            .call(
+                CallRequest {
+                    from: from.into(),
+                    to: Some(self.address),
+                    gas: options.gas,
+                    gas_price: options.gas_price,
+                    value: options.value,
+                    data: Some(Bytes(call)),
+                },
+                block.into(),
+            )
+            .await?;
+        let output = function.decode_output(&bytes.0)?;
+        R::from_tokens(output)
     }
 
     /// Find events matching the topics.
@@ -344,6 +324,39 @@ mod contract_signing {
                 confirmations,
             )
             .await
+        }
+
+        /// Execute a signed contract function
+        pub async fn signed_call(
+            &self,
+            func: &str,
+            params: impl Tokenize,
+            options: Options,
+            key: impl signing::Key,
+        ) -> crate::Result<H256> {
+            let fn_data = self
+                .abi
+                .function(func)
+                .and_then(|function| function.encode_input(&params.into_tokens()))
+                // TODO [ToDr] SendTransactionWithConfirmation should support custom error type (so that we can return
+                // `contract::Error` instead of more generic `Error`.
+                .map_err(|err| crate::error::Error::Decoder(format!("{:?}", err)))?;
+            let accounts = Accounts::new(self.eth.transport().clone());
+            let mut tx = TransactionParameters {
+                nonce: options.nonce,
+                to: Some(self.address),
+                gas_price: options.gas_price,
+                data: Bytes(fn_data),
+                ..Default::default()
+            };
+            if let Some(gas) = options.gas {
+                tx.gas = gas;
+            }
+            if let Some(value) = options.value {
+                tx.value = value;
+            }
+            let signed = accounts.sign_transaction(tx, key).await?;
+            self.eth.send_raw_transaction(signed.raw_transaction).await
         }
     }
 }
