@@ -13,6 +13,7 @@ use crate::{
 use std::{collections::HashMap, hash::Hash, time};
 
 pub mod deploy;
+pub mod ens;
 mod error;
 pub mod tokens;
 
