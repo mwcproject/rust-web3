@@ -1,5 +1,5 @@
 [package]
-name = "web3"
+name = "mwc-web3"
 version = "0.15.0"
 description = "Ethereum JSON-RPC client."
 homepage = "https://github.com/tomusdrw/rust-web3"
