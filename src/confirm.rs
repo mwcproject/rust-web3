@@ -44,20 +44,27 @@ where
     F: Future<Output = error::Result<Option<U64>>>,
 {
     let filter = eth_filter.create_blocks_filter().await?;
-    // TODO #396: The stream should have additional checks.
-    // * We should not continue calling next on a stream that has completed (has returned None). We expect this to never
-    //   happen for the blocks filter but to be safe we should handle this case for example by `fuse`ing the stream or
-    //   erroring when it does complete.
-    // * We do not handle the case where the stream returns an error which means we are wrongly counting it as a
-    //   confirmation.
     let filter_stream = filter.stream(poll_interval).skip(confirmations);
     futures::pin_mut!(filter_stream);
     loop {
-        let _ = filter_stream.next().await;
-        if let Some(confirmation_block_number) = check.check().await? {
-            let block_number = eth.block_number().await?;
-            if confirmation_block_number.low_u64() + confirmations as u64 <= block_number.low_u64() {
-                return Ok(());
+        match filter_stream.next().await {
+            Some(Ok(_)) => {
+                if let Some(confirmation_block_number) = check.check().await? {
+                    let block_number = eth.block_number().await?;
+                    if confirmation_block_number.low_u64() + confirmations as u64 <= block_number.low_u64() {
+                        return Ok(());
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                return Err(error::Error::Transport(error::TransportError::Message(
+                    format!("Stream error: {e}").into(),
+                )));
+            }
+            None => {
+                return Err(error::Error::Transport(error::TransportError::Message(
+                    "Stream ended unexpectedly".into(),
+                )));
             }
         }
     }
@@ -81,11 +88,13 @@ async fn send_transaction_with_confirmation_<T: Transport>(
         let eth = eth.clone();
         wait_for_confirmations(eth, eth_filter, poll_interval, confirmations, confirmation_check).await?;
     }
-    // TODO #397: We should remove this `expect`. No matter what happens inside the node, this shouldn't be a panic.
-    let receipt = eth
-        .transaction_receipt(hash)
-        .await?
-        .expect("receipt can't be null after wait for confirmations; qed");
+
+    let receipt = eth.transaction_receipt(hash).await?.ok_or_else(|| {
+        error::Error::Transport(error::TransportError::Message(format!(
+            "Transaction receipt not found for hash {:?} after {} confirmations",
+            hash, confirmations
+        )))
+    })?;
 
     Ok(receipt)
 }
