@@ -234,40 +234,28 @@ impl<T: Transport> Contract<T> {
         B: Into<Option<BlockId>>,
         P: Tokenize,
     {
-        let result = self
-            .abi
-            .function(func)
-            .and_then(|function| {
-                function
-                    .encode_input(&params.into_tokens())
-                    .map(|call| (call, function))
-            })
-            .map(|(call, function)| {
-                let call_future = self.eth.call(
-                    CallRequest {
-                        from: from.into(),
-                        to: Some(self.address),
-                        gas: options.gas,
-                        gas_price: options.gas_price,
-                        value: options.value,
-                        data: Some(Bytes(call)),
-                        transaction_type: options.transaction_type,
-                        access_list: options.access_list,
-                        max_fee_per_gas: options.max_fee_per_gas,
-                        max_priority_fee_per_gas: options.max_priority_fee_per_gas,
-                    },
-                    block.into(),
-                );
-                (call_future, function)
-            });
-        // NOTE for the batch transport to work correctly, we must call `transport.execute` without ever polling the future,
-        // hence it cannot be a fully `async` function.
-        async {
-            let (call_future, function) = result?;
-            let bytes = call_future.await?;
-            let output = function.decode_output(&bytes.0)?;
-            R::from_tokens(output)
-        }
+        let function = self.abi.function(func)?;
+        let call = function.encode_input(&params.into_tokens())?;
+        let bytes = self
+            .eth
+            .call(
+                CallRequest {
+                    from: from.into(),
+                    to: Some(self.address),
+                    gas: options.gas,
+                    gas_price: options.gas_price,
+                    value: options.value,
+                    data: Some(Bytes(call)),
+                    transaction_type: options.transaction_type,
+                    access_list: options.access_list,
+                    max_fee_per_gas: options.max_fee_per_gas,
+                    max_priority_fee_per_gas: options.max_priority_fee_per_gas,
+                },
+                block.into(),
+            )
+            .await?;
+        let output = function.decode_output(&bytes.0)?;
+        R::from_tokens(output)
     }
 
     /// Find events matching the topics.
