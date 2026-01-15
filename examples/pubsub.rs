@@ -1,9 +1,9 @@
-use web3::futures::{future, StreamExt};
+use mwc_web3::futures::{future, StreamExt};
 
 #[tokio::main]
-async fn main() -> web3::Result {
-    let ws = web3::transports::WebSocket::new("ws://localhost:8546").await?;
-    let web3 = web3::Web3::new(ws.clone());
+async fn main() -> mwc_web3::Result {
+    let ws = mwc_web3::transports::WebSocket::new("ws://localhost:8546").await?;
+    let web3 = mwc_web3::Web3::new(ws.clone());
     let mut sub = web3.eth_subscribe().subscribe_new_heads().await?;
 
     println!("Got subscription id: {:?}", sub.id());

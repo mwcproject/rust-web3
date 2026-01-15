@@ -1,10 +1,10 @@
 use hex_literal::hex;
 
 #[tokio::main]
-async fn main() -> web3::Result<()> {
+async fn main() -> mwc_web3::Result<()> {
     let _ = env_logger::try_init();
-    let transport = web3::transports::WebSocket::new("ws://localhost:8546").await?;
-    let web3 = web3::Web3::new(transport);
+    let transport = mwc_web3::transports::WebSocket::new("ws://localhost:8546").await?;
+    let web3 = mwc_web3::Web3::new(transport);
 
     println!("Calling accounts.");
     let mut accounts = web3.eth().accounts().await?;

@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use web3::{
+use mwc_web3::{
     ethabi::ethereum_types::U256,
     signing::SecretKey,
     types::{Address, TransactionParameters},
@@ -9,11 +9,11 @@ use web3::{
 /// Below generates and signs a transaction offline, before transmitting it to a public node (eg Infura)
 /// For sending a transaction to a local node that stores private keys (eg Ganache) see transaction_private
 #[tokio::main]
-async fn main() -> web3::Result {
+async fn main() -> mwc_web3::Result {
     // Sign up at infura > choose the desired network (eg Rinkeby) > copy the endpoint url into the below
     // If you need test ether use a faucet, eg https://faucet.rinkeby.io/
-    let transport = web3::transports::Http::new("https://rinkeby.infura.io/v3/XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")?;
-    let web3 = web3::Web3::new(transport);
+    let transport = mwc_web3::transports::Http::new("https://rinkeby.infura.io/v3/XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")?;
+    let web3 = mwc_web3::Web3::new(transport);
 
     // Insert the 20-byte "to" address in hex format (prefix with 0x)
     let to = Address::from_str("0xXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX").unwrap();

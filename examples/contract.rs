@@ -1,14 +1,14 @@
 use hex_literal::hex;
-use web3::{
+use mwc_web3::{
     contract::{Contract, Options},
     types::U256,
 };
 
 #[tokio::main]
-async fn main() -> web3::contract::Result<()> {
+async fn main() -> mwc_web3::contract::Result<()> {
     let _ = env_logger::try_init();
-    let http = web3::transports::Http::new("http://localhost:8545")?;
-    let web3 = web3::Web3::new(http);
+    let http = mwc_web3::transports::Http::new("http://localhost:8545")?;
+    let web3 = mwc_web3::Web3::new(http);
 
     let my_account = hex!("d028d24f16a8893bd078259d413372ac01580769").into();
     // Get the contract bytecode for instance from Solidity compiler
