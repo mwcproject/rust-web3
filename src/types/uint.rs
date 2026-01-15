@@ -2,6 +2,7 @@ pub use ethereum_types::{Bloom as H2048, H128, H160, H256, H512, H520, H64, U128
 
 #[cfg(test)]
 mod tests {
+    use ethereum_types::BigEndianHash;
     use super::*;
     use wasm_bindgen_test::*;
 

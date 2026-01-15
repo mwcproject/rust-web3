@@ -6,7 +6,6 @@ use crate::{
     Transport, Web3,
 };
 use hex::ToHex;
-use idna::Config;
 
 type ContractError = crate::contract::Error;
 type EthError = crate::ethabi::Error;
@@ -22,7 +21,6 @@ const CONTENTHASH_INTERFACE_ID: &[u8; 4] = &[0xbc, 0x1c, 0x58, 0xd1];
 pub struct Ens<T: Transport> {
     web3: Web3<T>,
     registry: Registry<T>,
-    idna: Config,
     transport: T,
 }
 
@@ -36,15 +34,10 @@ impl<T: Transport> Namespace<T> for Ens<T> {
 
         let registry = Registry::new(web3.eth());
 
-        let idna = Config::default()
-            .transitional_processing(false)
-            .use_std3_ascii_rules(true);
-
         Self {
             transport,
             web3,
             registry,
-            idna,
         }
     }
 
@@ -58,8 +51,8 @@ impl<T: Transport> Ens<T> {
     ///
     /// [Specification](https://docs.ens.domains/contract-api-reference/name-processing#normalising-names)
     fn normalize_name(&self, domain: &str) -> Result<String, ContractError> {
-        self.idna
-            .to_ascii(domain)
+        idna::domain_to_ascii_cow(domain.as_bytes(), idna::AsciiDenyList::STD3)
+            .map(|cow| cow.into_owned())
             .map_err(|_| ContractError::Abi(EthError::InvalidData))
     }
 
