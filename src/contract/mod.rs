@@ -5,8 +5,8 @@ use crate::{
     confirm,
     contract::tokens::{Detokenize, Tokenize},
     types::{
-        Address, BlockId, Bytes, CallRequest, FilterBuilder, TransactionCondition, TransactionReceipt,
-        TransactionRequest, H256, U256,
+        AccessList, Address, BlockId, Bytes, CallRequest, FilterBuilder, TransactionCondition, TransactionReceipt,
+        TransactionRequest, H256, U256, U64,
     },
     Transport,
 };
@@ -34,6 +34,10 @@ pub struct Options {
     pub nonce: Option<U256>,
     /// A condition to satisfy before including transaction.
     pub condition: Option<TransactionCondition>,
+    /// Transaction type, Some(1) for AccessList transaction, None for Legacy
+    pub transaction_type: Option<U64>,
+    /// Access list
+    pub access_list: Option<AccessList>,
 }
 
 impl Options {
@@ -126,6 +130,8 @@ impl<T: Transport> Contract<T> {
             value,
             nonce,
             condition,
+            transaction_type,
+            access_list,
         } = options;
         self.eth
             .send_transaction(TransactionRequest {
@@ -137,6 +143,8 @@ impl<T: Transport> Contract<T> {
                 nonce,
                 data: Some(Bytes(data)),
                 condition,
+                transaction_type,
+                access_list,
             })
             .await
             .map_err(Error::from)
@@ -169,6 +177,8 @@ impl<T: Transport> Contract<T> {
             nonce: options.nonce,
             data: Some(Bytes(fn_data)),
             condition: options.condition,
+            transaction_type: options.transaction_type,
+            access_list: options.access_list,
         };
         confirm::send_transaction_with_confirmation(
             self.eth.transport().clone(),
@@ -194,6 +204,8 @@ impl<T: Transport> Contract<T> {
                     gas_price: options.gas_price,
                     value: options.value,
                     data: Some(Bytes(data)),
+                    transaction_type: options.transaction_type,
+                    access_list: options.access_list,
                 },
                 None,
             )
@@ -209,24 +221,38 @@ impl<T: Transport> Contract<T> {
         B: Into<Option<BlockId>>,
         P: Tokenize,
     {
-        let function = self.abi.function(func)?;
-        let call = function.encode_input(&params.into_tokens())?;
-        let bytes = self
-            .eth
-            .call(
-                CallRequest {
-                    from: from.into(),
-                    to: Some(self.address),
-                    gas: options.gas,
-                    gas_price: options.gas_price,
-                    value: options.value,
-                    data: Some(Bytes(call)),
-                },
-                block.into(),
-            )
-            .await?;
-        let output = function.decode_output(&bytes.0)?;
-        R::from_tokens(output)
+        let result = self
+            .abi
+            .function(func)
+            .and_then(|function| {
+                function
+                    .encode_input(&params.into_tokens())
+                    .map(|call| (call, function))
+            })
+            .map(|(call, function)| {
+                let call_future = self.eth.call(
+                    CallRequest {
+                        from: from.into(),
+                        to: Some(self.address),
+                        gas: options.gas,
+                        gas_price: options.gas_price,
+                        value: options.value,
+                        data: Some(Bytes(call)),
+                        transaction_type: options.transaction_type,
+                        access_list: options.access_list,
+                    },
+                    block.into(),
+                );
+                (call_future, function)
+            });
+        // NOTE for the batch transport to work correctly, we must call `transport.execute` without ever polling the future,
+        // hence it cannot be a fully `async` function.
+        async {
+            let (call_future, function) = result?;
+            let bytes = call_future.await?;
+            let output = function.decode_output(&bytes.0)?;
+            R::from_tokens(output)
+        }
     }
 
     /// Find events matching the topics.
