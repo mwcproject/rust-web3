@@ -6,12 +6,12 @@
 //! # Example
 //! ```no_run
 //! ##[tokio::main]
-//! async fn main() -> web3::Result<()> {
-//!     use crate::web3::api::Namespace;
+//! async fn main() -> mwc_web3::Result<()> {
+//!     use crate::mwc_web3::api::Namespace;
 //!
-//!     let transport = web3::transports::Http::new("http://localhost:8545")?;
+//!     let transport = mwc_web3::transports::Http::new("http://localhost:8545")?;
 //!     
-//!     let ens = web3::contract::ens::Ens::new(transport);
+//!     let ens = mwc_web3::contract::ens::Ens::new(transport);
 //!
 //!     let address = ens.eth_address("vitalik.eth").await.unwrap();
 //!

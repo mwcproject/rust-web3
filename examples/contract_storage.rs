@@ -1,16 +1,16 @@
 //based on examples/contract.rs
 
 use std::time;
-use web3::{
+use mwc_web3::{
     contract::{Contract, Options},
     types::U256,
 };
 
 #[tokio::main]
-async fn main() -> web3::contract::Result<()> {
+async fn main() -> mwc_web3::contract::Result<()> {
     let _ = env_logger::try_init();
-    let transport = web3::transports::Http::new("http://localhost:8545")?;
-    let web3 = web3::Web3::new(transport);
+    let transport = mwc_web3::transports::Http::new("http://localhost:8545")?;
+    let web3 = mwc_web3::Web3::new(transport);
     let accounts = web3.eth().accounts().await?;
 
     // Get current balance

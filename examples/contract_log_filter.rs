@@ -1,15 +1,15 @@
 use hex_literal::hex;
 use std::time;
-use web3::{
+use mwc_web3::{
     contract::{Contract, Options},
     futures::StreamExt,
     types::FilterBuilder,
 };
 
 #[tokio::main]
-async fn main() -> web3::contract::Result<()> {
+async fn main() -> mwc_web3::contract::Result<()> {
     let _ = env_logger::try_init();
-    let web3 = web3::Web3::new(web3::transports::Http::new("http://localhost:8545")?);
+    let web3 = mwc_web3::Web3::new(mwc_web3::transports::Http::new("http://localhost:8545")?);
 
     // Get the contract bytecode for instance from Solidity compiler
     let bytecode = include_str!("./res/SimpleEvent.bin");

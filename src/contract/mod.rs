@@ -350,21 +350,6 @@ mod contract_signing {
             accounts.sign_transaction(tx, key).await
         }
 
-        /// Submit contract call transaction to the transaction pool.
-        ///
-        /// Note this function DOES NOT wait for any confirmations, so there is no guarantees that the call is actually executed.
-        /// If you'd rather wait for block inclusion, please use [`signed_call_with_confirmations`] instead.
-        pub async fn signed_call(
-            &self,
-            func: &str,
-            params: impl Tokenize,
-            options: Options,
-            key: impl signing::Key,
-        ) -> crate::Result<H256> {
-            let signed = self.sign(func, params, options, key).await?;
-            self.eth.send_raw_transaction(signed.raw_transaction).await
-        }
-
         /// Submit contract call transaction to the transaction pool and wait for the transaction to be included in a block.
         ///
         /// This function will wait for block inclusion of the transaction before returning.
