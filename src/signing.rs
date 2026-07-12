@@ -6,7 +6,7 @@ use crate::types::H256;
 #[derive(Debug, derive_more::Display, PartialEq, Clone)]
 pub enum SigningError {
     /// A message to sign is invalid. Has to be a non-zero 32-bytes slice.
-    #[display(fmt = "Message has to be a non-zero 32-bytes slice.")]
+    #[display("Message has to be a non-zero 32-bytes slice.")]
     InvalidMessage,
 }
 impl std::error::Error for SigningError {}
@@ -15,10 +15,10 @@ impl std::error::Error for SigningError {}
 #[derive(Debug, derive_more::Display, PartialEq, Clone)]
 pub enum RecoveryError {
     /// A message to recover is invalid. Has to be a non-zero 32-bytes slice.
-    #[display(fmt = "Message has to be a non-zero 32-bytes slice.")]
+    #[display("Message has to be a non-zero 32-bytes slice.")]
     InvalidMessage,
     /// A signature is invalid and the sender could not be recovered.
-    #[display(fmt = "Signature is invalid (check recovery id).")]
+    #[display("Signature is invalid (check recovery id).")]
     InvalidSignature,
 }
 impl std::error::Error for RecoveryError {}

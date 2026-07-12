@@ -295,7 +295,11 @@ impl<T: Transport> Contract<T> {
         logs.into_iter()
             .map(move |l| {
                 let log = ev.parse_log(ethabi::RawLog {
-                    topics: l.topics,
+                    topics: l
+                        .topics
+                        .into_iter()
+                        .map(|topic| ethabi::Hash::from_slice(topic.as_bytes()))
+                        .collect(),
                     data: l.data.0,
                 })?;
 

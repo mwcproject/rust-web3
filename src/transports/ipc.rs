@@ -122,7 +122,7 @@ impl futures::Future for SingleResponse {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.0 {
             Err(err) => Poll::Ready(Err(err.clone())),
-            Ok(ref mut rx) => {
+            Ok(rx) => {
                 let output = ready!(futures::Future::poll(Pin::new(rx), cx))?;
                 Poll::Ready(helpers::to_result_from_output(output))
             }
@@ -138,7 +138,7 @@ impl futures::Future for BatchResponse {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.0 {
             Err(err) => Poll::Ready(Err(err.clone())),
-            Ok(ref mut rxs) => {
+            Ok(rxs) => {
                 let poll = futures::Future::poll(Pin::new(rxs), cx);
                 let values = ready!(poll)
                     .into_iter()

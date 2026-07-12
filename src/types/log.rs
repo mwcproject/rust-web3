@@ -187,11 +187,11 @@ impl FilterBuilder {
 }
 
 /// Converts a `Topic` to an equivalent `Option<Vec<T>>`, suitable for `FilterBuilder::topics`
-fn topic_to_option<T>(topic: ethabi::Topic<T>) -> Option<Vec<T>> {
+fn topic_to_option(topic: ethabi::Topic<ethabi::Hash>) -> Option<Vec<H256>> {
     match topic {
         ethabi::Topic::Any => None,
-        ethabi::Topic::OneOf(v) => Some(v),
-        ethabi::Topic::This(t) => Some(vec![t]),
+        ethabi::Topic::OneOf(v) => Some(v.into_iter().map(|hash| H256::from_slice(hash.as_bytes())).collect()),
+        ethabi::Topic::This(t) => Some(vec![H256::from_slice(t.as_bytes())]),
     }
 }
 
@@ -296,9 +296,9 @@ mod tests {
     #[test]
     fn does_topic_filter_set_topics_correctly() {
         let topic_filter = ethabi::TopicFilter {
-            topic0: ethabi::Topic::This(H256::from_low_u64_be(3)),
-            topic1: ethabi::Topic::OneOf(vec![5, 8].into_iter().map(H256::from_low_u64_be).collect()),
-            topic2: ethabi::Topic::This(H256::from_low_u64_be(13)),
+            topic0: ethabi::Topic::This(ethabi::Hash::from_low_u64_be(3)),
+            topic1: ethabi::Topic::OneOf(vec![5, 8].into_iter().map(ethabi::Hash::from_low_u64_be).collect()),
+            topic2: ethabi::Topic::This(ethabi::Hash::from_low_u64_be(13)),
             topic3: ethabi::Topic::Any,
         };
         let filter0 = FilterBuilder::default().topic_filter(topic_filter).build();

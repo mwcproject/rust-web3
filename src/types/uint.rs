@@ -16,9 +16,9 @@ mod tests {
         arr[29] = 1;
         arr[28] = 0;
         arr[27] = 10;
-        let a = U256::from(arr.as_ref());
+        let a = U256::from_big_endian(arr.as_ref());
         arr[27] = 9;
-        let b = U256::from(arr.as_ref());
+        let b = U256::from_big_endian(arr.as_ref());
         let c = U256::from(0);
         let d = U256::from(10_000);
 
@@ -38,7 +38,7 @@ mod tests {
         arr[29] = 1;
         arr[28] = 0;
         arr[27] = 10;
-        let a = U256::from(arr.as_ref());
+        let a = U256::from_big_endian(arr.as_ref());
         let b = U256::from(1023);
         let c = U256::from(0);
         let d = U256::from(10000);
@@ -76,7 +76,7 @@ mod tests {
         arr[13] = 1;
         arr[12] = 0;
         arr[11] = 10;
-        let a = H128::from_uint(&arr.into());
+        let a = H128::from_uint(&U128::from_big_endian(&arr));
         let b = H128::from_uint(&1023.into());
         let c = H128::from_uint(&0.into());
         let d = H128::from_uint(&10000.into());

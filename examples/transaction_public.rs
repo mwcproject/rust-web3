@@ -1,9 +1,8 @@
 use std::str::FromStr;
 
 use mwc_web3::{
-    ethabi::ethereum_types::U256,
     signing::SecretKey,
-    types::{Address, TransactionParameters},
+    types::{Address, TransactionParameters, U256},
 };
 
 /// Below generates and signs a transaction offline, before transmitting it to a public node (eg Infura)

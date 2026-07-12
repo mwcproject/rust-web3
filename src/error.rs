@@ -11,10 +11,10 @@ pub type Result<T = ()> = std::result::Result<T, Error>;
 #[derive(Display, Debug, Clone, PartialEq)]
 pub enum TransportError {
     /// Transport-specific error code.
-    #[display(fmt = "code {}", _0)]
+    #[display("code {}", _0)]
     Code(u16),
     /// Arbitrary, developer-readable description of the occurred error.
-    #[display(fmt = "{}", _0)]
+    #[display("{}", _0)]
     Message(String),
 }
 
@@ -22,33 +22,33 @@ pub enum TransportError {
 #[derive(Debug, Display, From)]
 pub enum Error {
     /// server is unreachable
-    #[display(fmt = "Server is unreachable")]
+    #[display("Server is unreachable")]
     Unreachable,
     /// decoder error
-    #[display(fmt = "Decoder error: {}", _0)]
+    #[display("Decoder error: {}", _0)]
     Decoder(String),
     /// invalid response
-    #[display(fmt = "Got invalid response: {}", _0)]
+    #[display("Got invalid response: {}", _0)]
     #[from(ignore)]
     InvalidResponse(String),
     /// transport error
-    #[display(fmt = "Transport error: {}" _0)]
+    #[display("Transport error: {}", _0)]
     #[from(ignore)]
     Transport(TransportError),
     /// rpc error
-    #[display(fmt = "RPC error: {:?}", _0)]
+    #[display("RPC error: {:?}", _0)]
     Rpc(RPCError),
     /// io error
-    #[display(fmt = "IO error: {}", _0)]
+    #[display("IO error: {}", _0)]
     Io(IoError),
     /// recovery error
-    #[display(fmt = "Recovery error: {}", _0)]
+    #[display("Recovery error: {}", _0)]
     Recovery(crate::signing::RecoveryError),
     /// web3 internal error
-    #[display(fmt = "Internal Web3 error")]
+    #[display("Internal Web3 error")]
     Internal,
     /// Transaction reverted
-    #[display(fmt = "Transaction reverted: {}", _0)]
+    #[display("Transaction reverted: {}", _0)]
     #[from(ignore)]
     Revert(String),
 }

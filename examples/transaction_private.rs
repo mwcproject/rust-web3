@@ -1,8 +1,7 @@
 use std::str::FromStr;
 
 use mwc_web3::{
-    ethabi::ethereum_types::U256,
-    types::{Address, TransactionRequest},
+    types::{Address, TransactionRequest, U256},
 };
 
 /// Below sends a transaction to a local node that stores private keys (eg Ganache)

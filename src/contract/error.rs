@@ -8,16 +8,16 @@ use ethabi::Error as EthError;
 #[derive(Debug, Display, From)]
 pub enum Error {
     /// invalid output type requested by the caller
-    #[display(fmt = "Invalid output type: {}", _0)]
+    #[display("Invalid output type: {}", _0)]
     InvalidOutputType(String),
     /// eth abi error
-    #[display(fmt = "Abi error: {}", _0)]
+    #[display("Abi error: {}", _0)]
     Abi(EthError),
     /// Rpc error
-    #[display(fmt = "Api error: {}", _0)]
+    #[display("Api error: {}", _0)]
     Api(ApiError),
     /// An error during deployment.
-    #[display(fmt = "Deployment error: {}", _0)]
+    #[display("Deployment error: {}", _0)]
     Deployment(crate::contract::deploy::Error),
     /// Contract does not support this interface.
     InterfaceUnsupported,
@@ -43,13 +43,13 @@ pub mod deploy {
     #[derive(Debug, Display, From)]
     pub enum Error {
         /// eth abi error
-        #[display(fmt = "Abi error: {}", _0)]
+        #[display("Abi error: {}", _0)]
         Abi(ethabi::Error),
         /// Rpc error
-        #[display(fmt = "Api error: {}", _0)]
+        #[display("Api error: {}", _0)]
         Api(ApiError),
         /// Contract deployment failed
-        #[display(fmt = "Failure during deployment.Tx hash: {:?}", _0)]
+        #[display("Failure during deployment.Tx hash: {:?}", _0)]
         ContractDeploymentFailure(H256),
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "mwc-web3"
-version = "0.20.0"
+version = "0.20.1"
 description = "Ethereum JSON-RPC client."
 homepage = "https://github.com/tomusdrw/rust-web3"
 repository = "https://github.com/tomusdrw/rust-web3"
@@ -9,32 +9,32 @@ license = "MIT"
 keywords = ["jsonrpc", "web3", "ethereum", "rpc", "client"]
 authors = ["Tomasz Drwięga <tomasz@parity.io>"]
 readme = "README.md"
-edition = "2018"
+edition = "2024"
 
 [dependencies]
 arrayvec = "0.7.1"
-derive_more = "0.99.1"
+derive_more = { version = "2.1", features = ["display", "from"] }
 ethabi = "18.0.0"
-ethereum-types = "0.14.1"
-futures = "0.3.5"
-futures-timer = "3.0.2"
+ethereum-types = "0.16"
+futures = "0.3"
+futures-timer = "3.0"
 hex = "0.4"
-idna = "1.0.3"
-jsonrpc-core = "18.0.0"
-log = "0.4.6"
-parking_lot = "0.12.0"
-rlp = "0.5"
-serde = { version = "1.0.90", features = ["derive"] }
-serde_json = "1.0.39"
-tiny-keccak = { version = "2.0.1", features = ["keccak"] }
-pin-project = "1.0"
+idna = "1.1"
+jsonrpc-core = "18.0"
+log = "0.4"
+parking_lot = "0.12"
+rlp = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+pin-project = "1.1"
 # Optional deps
 secp256k1 = { version = "0.29", features = ["recovery"], optional = true }
-once_cell = { version = "1.8.0", optional = true }
+once_cell = { version = "1.21", optional = true }
 
 ## HTTP
 base64 = { version = "0.22", optional = true }
-bytes = { version = "1.0", optional = true }
+bytes = { version = "1", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
 headers = { version = "0.4", optional = true }
 ## WS
@@ -44,27 +44,27 @@ async-native-tls = { package = "web3-async-native-tls", version = "0.4", optiona
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pki-types = { version = "1", optional = true }
 webpki-roots = { version = "0.26", optional = true }
-async-std = { version = "1.6", optional = true }
-tokio = { version = "1.0", optional = true, features = ["full"] }
+async-std = { version = "1.13", optional = true }
+tokio = { version = "1.52", optional = true, features = ["full"] }
 tokio-stream = { version = "0.1", optional = true }
 tokio-util = { version = "0.7", optional = true, features = ["compat", "io"] }
-soketto = { version = "0.8.0", optional = true }
+soketto = { version = "0.8", optional = true }
 ## Shared (WS, HTTP)
-url = { version = "2.5.4", optional = true }
+url = { version = "2.5", optional = true }
 ## EIP-1193
-js-sys = { version = "0.3.77", optional = true }
+js-sys = { version = "0.3", optional = true }
 ### This is a transitive dependency, only here so we can turn on its wasm_bindgen feature
-getrandom = { version = "0.2", features = ["js"], optional = true }
-rand = { version = "0.8.1", optional = true }
-serde-wasm-bindgen = { version = "0.6.0", optional = true }
-wasm-bindgen = { version = "0.2.100", optional = true }
-wasm-bindgen-futures = { version = "0.4.50", optional = true }
+getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
+rand = { version = "0.10", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [dev-dependencies]
 # For examples
 env_logger = "0.11"
-hex-literal = "0.4"
-wasm-bindgen-test = "0.3.50"
+hex-literal = "1.1"
+wasm-bindgen-test = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 hyper = { version = "1.4", default-features = false, features = ["server"] }

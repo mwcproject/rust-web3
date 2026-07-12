@@ -5,7 +5,7 @@ use crate::{
     types::{Address, Bytes, BytesArray, H256, U128, U256},
 };
 use arrayvec::ArrayVec;
-use ethabi::Token;
+use ethabi::{Token, Uint};
 
 /// Output type possible to deserialize from Contract ABI
 pub trait Detokenize {
@@ -196,13 +196,13 @@ impl Tokenizable for H256 {
 impl Tokenizable for Address {
     fn from_token(token: Token) -> Result<Self, Error> {
         match token {
-            Token::Address(data) => Ok(data),
+            Token::Address(data) => Ok(Address::from_slice(data.as_bytes())),
             other => Err(Error::InvalidOutputType(format!("Expected `Address`, got {:?}", other))),
         }
     }
 
     fn into_token(self) -> Token {
-        Token::Address(self)
+        Token::Address(ethabi::Address::from_slice(self.as_bytes()))
     }
 }
 
@@ -211,13 +211,19 @@ macro_rules! eth_uint_tokenizable {
         impl Tokenizable for $uint {
             fn from_token(token: Token) -> Result<Self, Error> {
                 match token {
-                    Token::Int(data) | Token::Uint(data) => Ok(::std::convert::TryInto::try_into(data).unwrap()),
+                    Token::Int(data) | Token::Uint(data) => {
+                        let mut bytes = [0; 32];
+                        data.to_big_endian(&mut bytes);
+                        let data = U256::from_big_endian(&bytes);
+                        Ok(::std::convert::TryInto::try_into(data).unwrap())
+                    }
                     other => Err(Error::InvalidOutputType(format!("Expected `{}`, got {:?}", $name, other)).into()),
                 }
             }
 
             fn into_token(self) -> Token {
-                Token::Uint(self.into())
+                let data: U256 = self.into();
+                Token::Uint(Uint::from_big_endian(&data.to_big_endian()))
             }
         }
     };
@@ -247,7 +253,7 @@ macro_rules! int_tokenizable {
                     // NOTE: Rust does sign extension when converting from a
                     // signed integer to an unsigned integer, so:
                     // `-1u8 as u128 == u128::max_value()`
-                    U256::from(self as u128) | U256([0, 0, u64::max_value(), u64::max_value()])
+                    Uint::from(self as u128) | (Uint::MAX << 128)
                 } else {
                     self.into()
                 };
@@ -442,7 +448,7 @@ impl_fixed_types!(1024);
 #[cfg(test)]
 mod tests {
     use super::{Detokenize, Tokenizable};
-    use crate::types::{Address, BytesArray, U256};
+    use crate::types::{Address, BytesArray, U128, U256};
     use ethabi::{Token, Uint};
     use hex_literal::hex;
 
@@ -501,11 +507,23 @@ mod tests {
     }
 
     #[test]
+    fn should_roundtrip_upgraded_ethereum_types_through_ethabi_tokens() {
+        let address = Address::from_low_u64_be(0x1234);
+        assert_eq!(Address::from_token(address.into_token()).unwrap(), address);
+
+        let uint256 = U256::MAX - 42;
+        assert_eq!(U256::from_token(uint256.into_token()).unwrap(), uint256);
+
+        let uint128 = U128::MAX - 42;
+        assert_eq!(U128::from_token(uint128.into_token()).unwrap(), uint128);
+    }
+
+    #[test]
     fn should_sign_extend_negative_integers() {
-        assert_eq!((-1i8).into_token(), Token::Int(U256::MAX));
-        assert_eq!((-2i16).into_token(), Token::Int(U256::MAX - 1));
-        assert_eq!((-3i32).into_token(), Token::Int(U256::MAX - 2));
-        assert_eq!((-4i64).into_token(), Token::Int(U256::MAX - 3));
-        assert_eq!((-5i128).into_token(), Token::Int(U256::MAX - 4));
+        assert_eq!((-1i8).into_token(), Token::Int(Uint::MAX));
+        assert_eq!((-2i16).into_token(), Token::Int(Uint::MAX - 1));
+        assert_eq!((-3i32).into_token(), Token::Int(Uint::MAX - 2));
+        assert_eq!((-4i64).into_token(), Token::Int(Uint::MAX - 3));
+        assert_eq!((-5i128).into_token(), Token::Int(Uint::MAX - 4));
     }
 }
