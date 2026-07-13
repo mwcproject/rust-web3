@@ -2,9 +2,9 @@ use crate::types::Bytes;
 use ethereum_types::{H256, U256};
 use serde::{Deserialize, Serialize};
 
-///Proof struct returned by eth_getProof method
+/// Proof struct returned by eth_getProof method
 ///
-/// https://eips.ethereum.org/EIPS/eip-1186
+/// <https://eips.ethereum.org/EIPS/eip-1186>
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Proof {
     /// the balance of the account. See eth_getBalance

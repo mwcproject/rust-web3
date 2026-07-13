@@ -5,17 +5,29 @@ use crate::types::H256;
 /// Error during signing.
 #[derive(Debug, derive_more::Display, PartialEq, Clone)]
 pub enum SigningError {
-    /// A message to sign is invalid. Has to be a non-zero 32-bytes slice.
-    #[display("Message has to be a non-zero 32-bytes slice.")]
+    /// A message to sign is invalid. It must be exactly 32 bytes.
+    #[display("Message has to be exactly 32 bytes.")]
     InvalidMessage,
+    /// The chain ID is too large to encode an EIP-155 recovery value.
+    #[display("Chain ID is too large to encode safely.")]
+    InvalidChainId,
+    /// The transaction type is not supported by the signer.
+    #[display("Unsupported transaction type: {_0}.")]
+    UnsupportedTransactionType(u64),
+    /// The signature implementation returned an invalid recovery identifier.
+    #[display("Signature recovery identifier is invalid.")]
+    InvalidRecoveryId,
+    /// The signature implementation returned invalid or non-canonical scalar values.
+    #[display("Signature scalar values are invalid or non-canonical.")]
+    InvalidSignature,
 }
 impl std::error::Error for SigningError {}
 
 /// Error during sender recovery.
 #[derive(Debug, derive_more::Display, PartialEq, Clone)]
 pub enum RecoveryError {
-    /// A message to recover is invalid. Has to be a non-zero 32-bytes slice.
-    #[display("Message has to be a non-zero 32-bytes slice.")]
+    /// A message to recover is invalid. It must be exactly 32 bytes.
+    #[display("Message has to be exactly 32 bytes.")]
     InvalidMessage,
     /// A signature is invalid and the sender could not be recovered.
     #[display("Signature is invalid (check recovery id).")]
@@ -47,8 +59,9 @@ mod feature_gated {
     /// To use secret keys securely, they should be wrapped in a struct that prevents
     /// leaving copies in memory (both when it's moved or dropped). Please take a look
     /// at:
-    /// - https://github.com/graphprotocol/solidity-bindgen/blob/master/solidity-bindgen/src/secrets.rs
-    /// - or https://crates.io/crates/zeroize
+    /// - <https://github.com/graphprotocol/solidity-bindgen/blob/master/solidity-bindgen/src/secrets.rs>
+    /// - or <https://crates.io/crates/zeroize>
+    ///
     /// if you care enough about your secrets to be used securely.
     ///
     /// If it's enough to pass a reference to `SecretKey` (lifetimes) than you can use `SecretKeyRef`
@@ -100,16 +113,31 @@ mod feature_gated {
 
     impl<T: Deref<Target = SecretKey>> Key for T {
         fn sign(&self, message: &[u8], chain_id: Option<u64>) -> Result<Signature, SigningError> {
-            let message = Message::from_digest_slice(message).map_err(|_| SigningError::InvalidMessage)?;
-            let (recovery_id, signature) = CONTEXT.sign_ecdsa_recoverable(&message, self).serialize_compact();
+            let digest = <[u8; 32]>::try_from(message).map_err(|_| SigningError::InvalidMessage)?;
+            let message = Message::from_digest(digest);
+            let (recovery_id, signature) = CONTEXT.sign_ecdsa_recoverable(message, self).serialize_compact();
 
-            let standard_v = recovery_id.to_i32() as u64;
+            let standard_v = match recovery_id {
+                RecoveryId::Zero => 0_u64,
+                RecoveryId::One => 1_u64,
+                _ => return Err(SigningError::InvalidRecoveryId),
+            };
             let v = if let Some(chain_id) = chain_id {
                 // When signing with a chain ID, add chain replay protection.
-                standard_v + 35 + chain_id * 2
+                chain_id
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(35))
+                    .and_then(|value| value.checked_add(standard_v))
+                    .ok_or(SigningError::InvalidChainId)?
             } else {
                 // Otherwise, convert to 'Electrum' notation.
-                standard_v + 27
+                // The Ethereum recovery ID was validated as 0 or 1, so this is at most 28.
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "validated recovery parity is at most one, so the sum is at most 28"
+                )]
+                let electrum_v = standard_v + 27;
+                electrum_v
             };
             let r = H256::from_slice(&signature[..32]);
             let s = H256::from_slice(&signature[32..]);
@@ -118,10 +146,15 @@ mod feature_gated {
         }
 
         fn sign_message(&self, message: &[u8]) -> Result<Signature, SigningError> {
-            let message = Message::from_digest_slice(message).map_err(|_| SigningError::InvalidMessage)?;
-            let (recovery_id, signature) = CONTEXT.sign_ecdsa_recoverable(&message, self).serialize_compact();
+            let digest = <[u8; 32]>::try_from(message).map_err(|_| SigningError::InvalidMessage)?;
+            let message = Message::from_digest(digest);
+            let (recovery_id, signature) = CONTEXT.sign_ecdsa_recoverable(message, self).serialize_compact();
 
-            let v = recovery_id.to_i32() as u64;
+            let v = match recovery_id {
+                RecoveryId::Zero => 0_u64,
+                RecoveryId::One => 1_u64,
+                _ => return Err(SigningError::InvalidRecoveryId),
+            };
             let r = H256::from_slice(&signature[..32]);
             let s = H256::from_slice(&signature[32..]);
 
@@ -137,15 +170,40 @@ mod feature_gated {
     ///
     /// Signature and `recovery_id` can be obtained from `types::Recovery` type.
     pub fn recover(message: &[u8], signature: &[u8], recovery_id: i32) -> Result<Address, RecoveryError> {
-        let message = Message::from_digest_slice(message).map_err(|_| RecoveryError::InvalidMessage)?;
-        let recovery_id = RecoveryId::from_i32(recovery_id).map_err(|_| RecoveryError::InvalidSignature)?;
+        let digest = <[u8; 32]>::try_from(message).map_err(|_| RecoveryError::InvalidMessage)?;
+        let message = Message::from_digest(digest);
+        let recovery_id = RecoveryId::try_from(recovery_id).map_err(|_| RecoveryError::InvalidSignature)?;
         let signature =
             RecoverableSignature::from_compact(signature, recovery_id).map_err(|_| RecoveryError::InvalidSignature)?;
         let public_key = CONTEXT
-            .recover_ecdsa(&message, &signature)
+            .recover_ecdsa(message, &signature)
             .map_err(|_| RecoveryError::InvalidSignature)?;
 
         Ok(public_key_address(&public_key))
+    }
+
+    /// Validate scalar range and Ethereum's low-S transaction-signature requirement.
+    pub(crate) fn validate_signature(signature: &Signature) -> Result<(), SigningError> {
+        const CURVE_ORDER: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ];
+        const HALF_CURVE_ORDER: [u8; 32] = [
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46,
+            0x68, 0x1b, 0x20, 0xa0,
+        ];
+        let r = signature.r.as_bytes();
+        let s = signature.s.as_bytes();
+        if r.iter().all(|byte| *byte == 0)
+            || r >= CURVE_ORDER.as_ref()
+            || s.iter().all(|byte| *byte == 0)
+            || s > HALF_CURVE_ORDER.as_ref()
+        {
+            return Err(SigningError::InvalidSignature);
+        }
+        Ok(())
     }
 
     /// Gets the address of a public key.
@@ -240,6 +298,29 @@ mod tests {
     use super::*;
 
     //See -> https://eips.ethereum.org/EIPS/eip-137 for test cases
+
+    #[cfg(feature = "signing")]
+    #[test]
+    fn validates_signature_scalar_boundaries() {
+        use hex_literal::hex;
+
+        let one = H256::from(hex!(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        let mut signature = Signature { v: 27, r: one, s: one };
+        assert_eq!(validate_signature(&signature), Ok(()));
+
+        signature.r = H256::from(hex!(
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
+        ));
+        assert_eq!(validate_signature(&signature), Err(SigningError::InvalidSignature));
+
+        signature.r = one;
+        signature.s = H256::from(hex!(
+            "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1"
+        ));
+        assert_eq!(validate_signature(&signature), Err(SigningError::InvalidSignature));
+    }
 
     #[test]
     fn name_hash_empty() {

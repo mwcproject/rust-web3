@@ -11,9 +11,9 @@ pub mod http;
 #[cfg(any(feature = "http", feature = "http-rustls-tls"))]
 pub use self::http::Http;
 
-#[cfg(any(feature = "ws-tokio", feature = "ws-async-std"))]
+#[cfg(any(feature = "ws-tokio", feature = "ws-async-io"))]
 pub mod ws;
-#[cfg(any(feature = "ws-tokio", feature = "ws-async-std"))]
+#[cfg(any(feature = "ws-tokio", feature = "ws-async-io"))]
 pub use self::ws::WebSocket;
 
 #[cfg(feature = "ipc-tokio")]
@@ -40,5 +40,5 @@ impl From<async_native_tls::Error> for crate::Error {
     }
 }
 
-#[cfg(feature = "eip-1193")]
+#[cfg(all(feature = "eip-1193", target_arch = "wasm32"))]
 pub mod eip_1193;

@@ -34,7 +34,7 @@ impl<T: Transport> Parity<T> {
     }
 
     /// Get pending transactions
-    /// Blocked by https://github.com/openethereum/openethereum/issues/159
+    /// Blocked by <https://github.com/openethereum/openethereum/issues/159>
     pub fn pending_transactions(
         &self,
         limit: Option<usize>,

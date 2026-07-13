@@ -10,9 +10,9 @@ keywords = ["jsonrpc", "web3", "ethereum", "rpc", "client"]
 authors = ["Tomasz Drwięga <tomasz@parity.io>"]
 readme = "README.md"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
-arrayvec = "0.7.1"
 derive_more = { version = "2.1", features = ["display", "from"] }
 ethabi = "18.0.0"
 ethereum-types = "0.16"
@@ -29,22 +29,23 @@ serde_json = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 pin-project = "1.1"
 # Optional deps
-secp256k1 = { version = "0.29", features = ["recovery"], optional = true }
+secp256k1 = { version = "0.31", features = ["recovery"], optional = true }
 once_cell = { version = "1.21", optional = true }
 
 ## HTTP
 base64 = { version = "0.22", optional = true }
 bytes = { version = "1", optional = true }
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "stream"] }
 headers = { version = "0.4", optional = true }
 ## WS
-# async-native-tls = { git = "https://github.com/async-email/async-native-tls.git", rev = "b5b5562d6cea77f913d4cbe448058c031833bf17", optional = true, default-features = false }
-# Temporarily use forked version released to crates.io
-async-native-tls = { package = "web3-async-native-tls", version = "0.4", optional = true, default-features = false }
+async-native-tls = { version = "0.6", optional = true, default-features = false }
+native-tls = { version = "0.2", optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pki-types = { version = "1", optional = true }
-webpki-roots = { version = "0.26", optional = true }
-async-std = { version = "1.13", optional = true }
+webpki-roots = { version = "1", optional = true }
+async-global-executor = { version = "3.1", optional = true }
+async-net = { version = "2", optional = true }
 tokio = { version = "1.52", optional = true, features = ["full"] }
 tokio-stream = { version = "0.1", optional = true }
 tokio-util = { version = "0.7", optional = true, features = ["compat", "io"] }
@@ -81,13 +82,15 @@ _http_base = ["reqwest", "bytes", "url", "base64"]
 http = ["_http_base"]
 http-tls = ["http", "reqwest/default-tls"]
 http-native-tls = ["http", "reqwest/native-tls"]
-http-rustls-tls = ["http", "reqwest/rustls-tls"]
+http-rustls-tls = ["http", "reqwest/rustls"]
 signing = ["secp256k1", "once_cell"]
 ws-tokio = ["soketto", "url", "tokio", "tokio-util", "headers"]
-ws-async-std = ["soketto", "url", "async-std", "headers"]
-ws-tls-tokio = ["async-native-tls", "async-native-tls/runtime-tokio", "ws-tokio"]
+ws-async-io = ["soketto", "url", "async-global-executor", "async-net", "headers"]
+ws-async-std = ["ws-async-io"]
+ws-tls-tokio = ["native-tls", "tokio-native-tls", "ws-tokio"]
 ws-rustls-tokio = ["tokio-rustls", "webpki-roots", "rustls-pki-types", "ws-tokio"]
-ws-tls-async-std = ["async-native-tls", "async-native-tls/runtime-async-std", "ws-async-std"]
+ws-tls-async-io = ["async-native-tls", "async-native-tls/runtime-smol", "ws-async-io"]
+ws-tls-async-std = ["ws-tls-async-io"]
 ipc-tokio = ["tokio", "tokio-stream", "tokio-util"]
 arbitrary_precision = ["serde_json/arbitrary_precision", "jsonrpc-core/arbitrary_precision"]
 test = []

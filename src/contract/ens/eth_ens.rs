@@ -439,7 +439,7 @@ impl<T: Transport> Ens<T> {
         }
 
         // https://eips.ethereum.org/EIPS/eip-1577
-        if !(hash[0] == 0xe3 || hash[0] == 0xe4) {
+        if !matches!(hash.first(), Some(0xe3 | 0xe4)) {
             return Err(ContractError::Abi(EthError::InvalidData));
         }
 
@@ -565,5 +565,22 @@ impl<T: Transport> Ens<T> {
         } */
 
         resolver.set_canonical_name(from, node, name).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transports::test::TestTransport;
+
+    #[test]
+    fn empty_content_hash_returns_an_error() {
+        let mut transport = TestTransport::default();
+        transport.add_response(crate::rpc::Value::String(format!("0x{:064x}", 0)));
+        transport.add_response(crate::rpc::Value::String(format!("0x{:064x}", 1)));
+        let ens = Ens::new(transport);
+        let result = futures::executor::block_on(ens.set_content_hash(Address::zero(), "example.eth", Vec::new()));
+
+        assert!(matches!(result, Err(ContractError::Abi(EthError::InvalidData))));
     }
 }

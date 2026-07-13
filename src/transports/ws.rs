@@ -16,13 +16,16 @@ use soketto::{
     handshake::{Client, ServerResponse},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     marker::Unpin,
     pin::Pin,
     sync::{atomic, Arc},
 };
 use url::Url;
+
+const DEFAULT_MAX_WS_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
+const DEFAULT_WS_CHANNEL_CAPACITY: usize = 256;
 
 impl From<soketto::handshake::Error> for Error {
     fn from(err: soketto::handshake::Error) -> Self {
@@ -38,15 +41,18 @@ impl From<connection::Error> for Error {
 
 type SingleResult = error::Result<rpc::Value>;
 type BatchResult = error::Result<Vec<SingleResult>>;
-type Pending = oneshot::Sender<BatchResult>;
-type Subscription = mpsc::UnboundedSender<rpc::Value>;
+struct Pending {
+    ids: Vec<RequestId>,
+    sender: oneshot::Sender<BatchResult>,
+}
+type Subscription = mpsc::Sender<rpc::Value>;
 
 /// Stream, either plain TCP or TLS.
 enum MaybeTlsStream<P, T> {
     /// Unencrypted socket stream.
     Plain(P),
     /// Encrypted socket stream.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "non-TLS feature builds retain the type-unifying TLS variant")]
     Tls(T),
 }
 
@@ -99,7 +105,7 @@ struct WsServerTask {
 
 impl WsServerTask {
     /// Create new WebSocket transport.
-    pub async fn new(url: &str) -> error::Result<Self> {
+    pub async fn new(url: &str, max_response_size: usize) -> error::Result<Self> {
         let url = Url::parse(url)?;
 
         let scheme = match url.scheme() {
@@ -123,28 +129,76 @@ impl WsServerTask {
 
         let port = url.port().unwrap_or(if scheme == "ws" { 80 } else { 443 });
 
+        #[cfg(not(any(feature = "ws-tls-tokio", feature = "ws-tls-async-io", feature = "ws-rustls-tokio")))]
+        if scheme == "wss" {
+            return Err(Error::Transport(TransportError::Message(
+                "WSS requires ws-tls-tokio, ws-rustls-tokio, or ws-tls-async-io".into(),
+            )));
+        }
+        #[cfg(all(
+            feature = "ws-tokio",
+            feature = "ws-tls-async-io",
+            not(feature = "ws-tls-tokio"),
+            not(feature = "ws-rustls-tokio")
+        ))]
+        if scheme == "wss" {
+            return Err(Error::Transport(TransportError::Message(
+                "ws-tls-async-io cannot provide TLS when ws-tokio selects the Tokio runtime".into(),
+            )));
+        }
+
         let addrs = format!("{}:{}", host, port);
 
         log::trace!("Connecting TcpStream with address: {}", addrs);
         let stream = compat::raw_tcp_stream(addrs).await?;
         stream.set_nodelay(true)?;
         let socket = if scheme == "wss" {
-            #[cfg(any(feature = "ws-tls-tokio", feature = "ws-tls-async-std"))]
+            #[cfg(feature = "ws-tls-tokio")]
             {
-                let stream = async_native_tls::connect(host, stream).await?;
+                let connector = native_tls::TlsConnector::new().map_err(|error| {
+                    Error::Transport(TransportError::Message(format!("TLS connector error: {error}")))
+                })?;
+                let stream = tokio_native_tls::TlsConnector::from(connector)
+                    .connect(host, stream)
+                    .await
+                    .map_err(|error| {
+                        Error::Transport(TransportError::Message(format!("TLS connection error: {error}")))
+                    })?;
                 MaybeTlsStream::Tls(compat::compat(stream))
             }
             #[cfg(all(
                 feature = "ws-rustls-tokio",
-                not(feature = "ws-tls-tokio"),
-                not(feature = "ws-tls-async-std")
+                not(feature = "ws-tls-tokio")
             ))]
             {
                 let stream = tokio_rustls_connect(host, stream).await?;
                 MaybeTlsStream::Tls(compat::compat(stream))
             }
-            #[cfg(not(any(feature = "ws-tls-tokio", feature = "ws-tls-async-std", feature = "ws-rustls-tokio")))]
-            panic!("The library was compiled without TLS support. Enable ws-tls-tokio, ws-rustls-tokio or ws-tls-async-std feature.");
+            #[cfg(all(
+                feature = "ws-tls-async-io",
+                not(feature = "ws-tokio"),
+                not(feature = "ws-tls-tokio"),
+                not(feature = "ws-rustls-tokio")
+            ))]
+            {
+                let stream = async_native_tls::connect(host, stream).await.map_err(|error| {
+                    Error::Transport(TransportError::Message(format!("TLS connection error: {error}")))
+                })?;
+                MaybeTlsStream::Tls(compat::compat(stream))
+            }
+            #[cfg(all(
+                feature = "ws-tokio",
+                feature = "ws-tls-async-io",
+                not(feature = "ws-tls-tokio"),
+                not(feature = "ws-rustls-tokio")
+            ))]
+            return Err(Error::Transport(TransportError::Message(
+                "ws-tls-async-io cannot provide TLS when ws-tokio selects the Tokio runtime".into(),
+            )));
+            #[cfg(not(any(feature = "ws-tls-tokio", feature = "ws-tls-async-io", feature = "ws-rustls-tokio")))]
+            return Err(Error::Transport(TransportError::Message(
+                "WSS requires ws-tls-tokio, ws-rustls-tokio, or ws-tls-async-io".into(),
+            )));
         } else {
             let stream = compat::compat(stream);
             MaybeTlsStream::Plain(stream)
@@ -182,7 +236,12 @@ impl WsServerTask {
         }
         let handshake = client.handshake();
         let (sender, receiver) = match handshake.await? {
-            ServerResponse::Accepted { .. } => client.into_builder().finish(),
+            ServerResponse::Accepted { .. } => {
+                let mut builder = client.into_builder();
+                builder.set_max_message_size(max_response_size);
+                builder.set_max_frame_size(max_response_size);
+                builder.finish()
+            }
             ServerResponse::Redirect { status_code, .. } => {
                 return Err(error::Error::Transport(TransportError::Code(status_code)))
             }
@@ -199,7 +258,7 @@ impl WsServerTask {
         })
     }
 
-    async fn into_task(self, requests: mpsc::UnboundedReceiver<TransportMessage>) {
+    async fn into_task(self, requests: mpsc::Receiver<TransportMessage>) {
         let Self {
             receiver,
             mut sender,
@@ -214,16 +273,43 @@ impl WsServerTask {
         loop {
             select! {
                 msg = requests.next() => match msg {
-                    Some(TransportMessage::Request { id, request, sender: tx }) => {
-                        if pending.insert(id, tx).is_some() {
-                            log::warn!("Replacing a pending request with id {:?}", id);
+                    Some(TransportMessage::Request { ids, request, sender: tx }) => {
+                        let Some(id) = ids.first().copied() else {
+                            if tx.send(Err(Error::InvalidResponse("empty WebSocket batch request".into()))).is_err() {
+                                log::trace!("WebSocket receiver dropped for empty batch request");
+                            }
+                            continue;
+                        };
+                        if ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len() {
+                            let error = Error::InvalidResponse(format!(
+                                "duplicate request id in WebSocket batch beginning with {id}"
+                            ));
+                            if tx.send(Err(error)).is_err() {
+                                log::trace!("Request receiver was dropped after duplicate batch id: {:?}", id);
+                            }
+                            continue;
                         }
+                        let collision = pending
+                            .values()
+                            .any(|request| request.ids.iter().any(|pending_id| ids.contains(pending_id)));
+                        if collision {
+                            let error = Error::Transport(TransportError::Message(format!(
+                                "request id collision in batch beginning with {id}"
+                            )));
+                            if tx.send(Err(error)).is_err() {
+                                log::trace!("Request receiver was dropped after id collision: {:?}", id);
+                            }
+                            continue;
+                        }
+                        pending.insert(id, Pending { ids, sender: tx });
                         let res = sender.send_text(request).await;
                         let res2 = sender.flush().await;
                         if let Err(e) = res.and(res2) {
                             // TODO [ToDr] Re-connect.
                             log::error!("WS connection error: {:?}", e);
-                            pending.remove(&id);
+                            let error = Error::from(e);
+                            fail_pending(&mut pending, &error);
+                            break;
                         }
                     }
                     Some(TransportMessage::Subscribe { id, sink }) => {
@@ -231,22 +317,31 @@ impl WsServerTask {
                             log::warn!("Replacing already-registered subscription with id {:?}", id);
                         }
                     }
-                    Some(TransportMessage::Unsubscribe { id }) => {
-                        if subscriptions.remove(&id).is_none() {
-                            log::warn!("Unsubscribing from non-existent subscription with id {:?}", id);
-                        }
+                    Some(TransportMessage::Unsubscribe { id }) if subscriptions.remove(&id).is_none() => {
+                        log::warn!("Unsubscribing from non-existent subscription with id {:?}", id);
                     }
+                    Some(TransportMessage::Unsubscribe { .. }) => {}
                     None => {}
                 },
                 res = receiver.next() => match res {
                     Some(Ok(data)) => {
-                        handle_message(&data, &subscriptions, &mut pending);
+                        if let Err(error) = handle_message(&data, &mut subscriptions, &mut pending) {
+                            log::error!("Invalid WS response: {}", error);
+                            fail_pending(&mut pending, &error);
+                            break;
+                        }
                     },
                     Some(Err(e)) => {
                         log::error!("WS connection error: {:?}", e);
+                        let error = Error::from(e);
+                        fail_pending(&mut pending, &error);
                         break;
                     },
-                    None => break,
+                    None => {
+                        let error = Error::Unreachable;
+                        fail_pending(&mut pending, &error);
+                        break;
+                    },
                 },
                 complete => break,
             }
@@ -254,7 +349,7 @@ impl WsServerTask {
     }
 }
 
-#[cfg(feature = "ws-rustls-tokio")]
+#[cfg(all(feature = "ws-rustls-tokio", not(feature = "ws-tls-tokio")))]
 async fn tokio_rustls_connect(
     host: &str,
     stream: tokio::net::TcpStream,
@@ -294,66 +389,107 @@ fn as_data_stream<T: Unpin + futures::AsyncRead + futures::AsyncWrite>(
 
 fn handle_message(
     data: &[u8],
-    subscriptions: &BTreeMap<SubscriptionId, Subscription>,
+    subscriptions: &mut BTreeMap<SubscriptionId, Subscription>,
     pending: &mut BTreeMap<RequestId, Pending>,
-) {
+) -> error::Result<()> {
     log::trace!("Message received: {:?}", data);
     if let Ok(notification) = helpers::to_notification_from_slice(data) {
+        if notification.method != "eth_subscription" {
+            log::warn!("Ignoring unsupported WS notification method: {}", notification.method);
+            return Ok(());
+        }
         if let rpc::Params::Map(params) = notification.params {
             let id = params.get("subscription");
             let result = params.get("result");
 
-            if let (Some(&rpc::Value::String(ref id)), Some(result)) = (id, result) {
+            if let (Some(rpc::Value::String(id)), Some(result)) = (id, result) {
                 let id: SubscriptionId = id.clone().into();
-                if let Some(stream) = subscriptions.get(&id) {
-                    if let Err(e) = stream.unbounded_send(result.clone()) {
-                        log::error!("Error sending notification: {:?} (id: {:?}", e, id);
+                let remove_subscription = if let Some(stream) = subscriptions.get_mut(&id) {
+                    if let Err(error) = stream.try_send(result.clone()) {
+                        log::error!("Closing backpressured subscription {:?}: {:?}", id, error);
+                        true
+                    } else {
+                        false
                     }
                 } else {
                     log::warn!("Got notification for unknown subscription (id: {:?})", id);
+                    false
+                };
+                if remove_subscription {
+                    subscriptions.remove(&id);
                 }
             } else {
-                log::error!("Got unsupported notification (id: {:?})", id);
-            }
-        }
-    } else {
-        let response = helpers::to_response_from_slice(data);
-        let outputs = match response {
-            Ok(rpc::Response::Single(output)) => vec![output],
-            Ok(rpc::Response::Batch(outputs)) => outputs,
-            _ => vec![],
-        };
-
-        let id = match outputs.get(0) {
-            Some(&rpc::Output::Success(ref success)) => success.id.clone(),
-            Some(&rpc::Output::Failure(ref failure)) => failure.id.clone(),
-            None => rpc::Id::Num(0),
-        };
-
-        if let rpc::Id::Num(num) = id {
-            if let Some(request) = pending.remove(&(num as usize)) {
-                log::trace!("Responding to (id: {:?}) with {:?}", num, outputs);
-                if let Err(err) = request.send(helpers::to_results_from_outputs(outputs)) {
-                    log::warn!("Sending a response to deallocated channel: {:?}", err);
-                }
-            } else {
-                log::warn!("Got response for unknown request (id: {:?})", num);
+                return Err(Error::InvalidResponse(format!("unsupported notification id: {id:?}")));
             }
         } else {
-            log::warn!("Got unsupported response (id: {:?})", id);
+            return Err(Error::InvalidResponse("notification parameters are not an object".into()));
+        }
+    } else {
+        let outputs = match helpers::to_response_from_slice(data)? {
+            rpc::Response::Single(output) => vec![output],
+            rpc::Response::Batch(outputs) if !outputs.is_empty() => outputs,
+            rpc::Response::Batch(_) => return Err(Error::InvalidResponse("empty batch response".into())),
+        };
+
+        let mut outputs_by_id = BTreeMap::new();
+        for output in outputs {
+            let id = match output.id() {
+                rpc::Id::Num(num) => RequestId::try_from(*num)
+                    .map_err(|_| Error::InvalidResponse(format!("response id {num} does not fit RequestId")))?,
+                id => return Err(Error::InvalidResponse(format!("unsupported response id: {id:?}"))),
+            };
+            if outputs_by_id.insert(id, output).is_some() {
+                return Err(Error::InvalidResponse(format!("duplicate response id: {id}")));
+            }
+        }
+
+        let first_id = outputs_by_id
+            .keys()
+            .next()
+            .copied()
+            .ok_or_else(|| Error::InvalidResponse("response contained no outputs".into()))?;
+        let pending_key = pending
+            .iter()
+            .find_map(|(key, request)| request.ids.contains(&first_id).then_some(*key))
+            .ok_or_else(|| Error::InvalidResponse(format!("response for unknown request id: {first_id}")))?;
+        let expected_ids = &pending.get(&pending_key).ok_or(Error::Internal)?.ids;
+        if expected_ids.len() != outputs_by_id.len() || expected_ids.iter().any(|id| !outputs_by_id.contains_key(id)) {
+            return Err(Error::InvalidResponse(format!(
+                "batch response IDs do not match request IDs: expected {expected_ids:?}"
+            )));
+        }
+        let request = pending.remove(&pending_key).ok_or(Error::Internal)?;
+        let ordered_outputs = request
+            .ids
+            .iter()
+            .map(|id| outputs_by_id.remove(id).ok_or(Error::Internal))
+            .collect::<error::Result<Vec<_>>>()?;
+        log::trace!("Responding to ids {:?} with {:?}", request.ids, ordered_outputs);
+        if let Err(err) = request.sender.send(helpers::to_results_from_outputs(ordered_outputs)) {
+            log::warn!("Sending a response to deallocated channel: {:?}", err);
+        }
+    }
+
+    Ok(())
+}
+
+fn fail_pending(pending: &mut BTreeMap<RequestId, Pending>, error: &Error) {
+    for (id, request) in std::mem::take(pending) {
+        if request.sender.send(Err(error.clone())).is_err() {
+            log::trace!("Request receiver was dropped while failing WS request: {:?}", id);
         }
     }
 }
 
 enum TransportMessage {
     Request {
-        id: RequestId,
+        ids: Vec<RequestId>,
         request: String,
         sender: oneshot::Sender<BatchResult>,
     },
     Subscribe {
         id: SubscriptionId,
-        sink: mpsc::UnboundedSender<rpc::Value>,
+        sink: mpsc::Sender<rpc::Value>,
     },
     Unsubscribe {
         id: SubscriptionId,
@@ -364,7 +500,8 @@ enum TransportMessage {
 #[derive(Clone)]
 pub struct WebSocket {
     id: Arc<atomic::AtomicUsize>,
-    requests: mpsc::UnboundedSender<TransportMessage>,
+    requests: Arc<parking_lot::Mutex<mpsc::Sender<TransportMessage>>>,
+    channel_capacity: usize,
 }
 
 impl fmt::Debug for WebSocket {
@@ -374,30 +511,59 @@ impl fmt::Debug for WebSocket {
 }
 
 impl WebSocket {
-    /// Create new WebSocket transport.
+    /// Create a WebSocket transport with a 16 MiB incoming frame and message limit.
     pub async fn new(url: &str) -> error::Result<Self> {
+        Self::new_with_limits(url, DEFAULT_MAX_WS_RESPONSE_SIZE, DEFAULT_WS_CHANNEL_CAPACITY).await
+    }
+
+    /// Create a WebSocket transport with a maximum incoming frame and message size.
+    pub async fn new_with_max_response_size(url: &str, max_response_size: usize) -> error::Result<Self> {
+        Self::new_with_limits(url, max_response_size, DEFAULT_WS_CHANNEL_CAPACITY).await
+    }
+
+    /// Create a WebSocket transport with response-size and internal-channel bounds.
+    pub async fn new_with_limits(
+        url: &str,
+        max_response_size: usize,
+        channel_capacity: usize,
+    ) -> error::Result<Self> {
+        if channel_capacity == 0 {
+            return Err(Error::Transport(TransportError::Message(
+                "WebSocket channel capacity must be greater than zero".into(),
+            )));
+        }
         let id = Arc::new(atomic::AtomicUsize::new(1));
-        let task = WsServerTask::new(url).await?;
-        // TODO [ToDr] Not unbounded?
-        let (sink, stream) = mpsc::unbounded();
+        let task = WsServerTask::new(url, max_response_size).await?;
+        let (sink, stream) = mpsc::channel(channel_capacity);
         // Spawn background task for the transport.
         #[cfg(feature = "ws-tokio")]
         tokio::spawn(task.into_task(stream));
-        #[cfg(feature = "ws-async-std")]
-        async_std::task::spawn(task.into_task(stream));
+        #[cfg(all(feature = "ws-async-io", not(feature = "ws-tokio")))]
+        async_global_executor::spawn(task.into_task(stream)).detach();
 
-        Ok(Self { id, requests: sink })
+        Ok(Self {
+            id,
+            requests: Arc::new(parking_lot::Mutex::new(sink)),
+            channel_capacity,
+        })
     }
 
     fn send(&self, msg: TransportMessage) -> error::Result {
-        self.requests.unbounded_send(msg).map_err(dropped_err)
+        self.requests.lock().try_send(msg).map_err(|error| {
+            let message = if error.is_full() {
+                "WebSocket request queue is full"
+            } else {
+                "Cannot send request because the WebSocket task finished"
+            };
+            Error::Transport(TransportError::Message(message.into()))
+        })
     }
 
-    fn send_request(&self, id: RequestId, request: rpc::Request) -> error::Result<oneshot::Receiver<BatchResult>> {
-        let request = helpers::to_string(&request);
-        log::debug!("[{}] Calling: {}", id, request);
+    fn send_request(&self, ids: Vec<RequestId>, request: rpc::Request) -> error::Result<oneshot::Receiver<BatchResult>> {
+        let request = helpers::to_string(&request)?;
+        log::debug!("[{:?}] Calling: {}", ids, request);
         let (sender, receiver) = oneshot::channel();
-        self.send(TransportMessage::Request { id, request, sender })?;
+        self.send(TransportMessage::Request { ids, request, sender })?;
         Ok(receiver)
     }
 }
@@ -451,7 +617,10 @@ where
         loop {
             match self.state {
                 ResponseState::Receiver(ref mut res) => {
-                    let receiver = res.take().expect("Receiver state is active only once; qed")?;
+                    let Some(response) = res.take() else {
+                        return Poll::Ready(Err(Error::Internal));
+                    };
+                    let receiver = response?;
                     self.state = ResponseState::Waiting(receiver)
                 }
                 ResponseState::Waiting(ref mut future) => {
@@ -467,14 +636,14 @@ impl Transport for WebSocket {
     type Out = Response<rpc::Value, fn(BatchResult) -> SingleResult>;
 
     fn prepare(&self, method: &str, params: Vec<rpc::Value>) -> (RequestId, rpc::Call) {
-        let id = self.id.fetch_add(1, atomic::Ordering::AcqRel);
+        let id = helpers::next_request_id(&self.id);
         let request = helpers::build_request(id, method, params);
 
         (id, request)
     }
 
     fn send(&self, id: RequestId, request: rpc::Call) -> Self::Out {
-        let response = self.send_request(id, rpc::Request::Single(request));
+        let response = self.send_request(vec![id], rpc::Request::Single(request));
         Response::new(response, batch_to_single)
     }
 }
@@ -486,20 +655,22 @@ impl BatchTransport for WebSocket {
     where
         T: IntoIterator<Item = (RequestId, rpc::Call)>,
     {
-        let mut it = requests.into_iter();
-        let (id, first) = it.next().map(|x| (x.0, Some(x.1))).unwrap_or_else(|| (0, None));
-        let requests = first.into_iter().chain(it.map(|x| x.1)).collect();
-        let response = self.send_request(id, rpc::Request::Batch(requests));
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        if requests.is_empty() {
+            return Response::new(Err(Error::InvalidResponse("empty WebSocket batch request".into())), batch_to_batch);
+        }
+        let ids = requests.iter().map(|(id, _)| *id).collect();
+        let calls = requests.into_iter().map(|(_, call)| call).collect();
+        let response = self.send_request(ids, rpc::Request::Batch(calls));
         Response::new(response, batch_to_batch)
     }
 }
 
 impl DuplexTransport for WebSocket {
-    type NotificationStream = mpsc::UnboundedReceiver<rpc::Value>;
+    type NotificationStream = mpsc::Receiver<rpc::Value>;
 
     fn subscribe(&self, id: SubscriptionId) -> error::Result<Self::NotificationStream> {
-        // TODO [ToDr] Not unbounded?
-        let (sink, stream) = mpsc::unbounded();
+        let (sink, stream) = mpsc::channel(self.channel_capacity);
         self.send(TransportMessage::Subscribe { id, sink })?;
         Ok(stream)
     }
@@ -510,15 +681,15 @@ impl DuplexTransport for WebSocket {
 }
 
 /// Compatibility layer between async-std and tokio
-#[cfg(feature = "ws-async-std")]
+#[cfg(all(feature = "ws-async-io", not(feature = "ws-tokio")))]
 #[doc(hidden)]
 pub mod compat {
-    pub use async_std::net::{TcpListener, TcpStream};
-    /// TLS stream type for async-std runtime.
-    #[cfg(feature = "ws-tls-async-std")]
+    pub use async_net::{TcpListener, TcpStream};
+    /// TLS stream type for the async-io runtime.
+    #[cfg(feature = "ws-tls-async-io")]
     pub type TlsStream = async_native_tls::TlsStream<TcpStream>;
     /// Dummy TLS stream type.
-    #[cfg(not(feature = "ws-tls-async-std"))]
+    #[cfg(not(feature = "ws-tls-async-io"))]
     pub type TlsStream = TcpStream;
 
     /// Create new TcpStream object.
@@ -546,7 +717,7 @@ pub mod compat {
     pub type TcpListener = tokio::net::TcpListener;
     /// TLS stream type for tokio runtime.
     #[cfg(feature = "ws-tls-tokio")]
-    pub type TlsStream = Compat<async_native_tls::TlsStream<tokio::net::TcpStream>>;
+    pub type TlsStream = Compat<tokio_native_tls::TlsStream<tokio::net::TcpStream>>;
     /// Rustls TLS stream type for tokio runtime.
     #[cfg(all(feature = "ws-rustls-tokio", not(feature = "ws-tls-tokio")))]
     pub type TlsStream = Compat<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
@@ -569,12 +740,8 @@ pub mod compat {
 mod tests {
     use super::*;
     use crate::{rpc, Transport};
-    use futures::{
-        io::{BufReader, BufWriter},
-        StreamExt,
-    };
+    use futures::io::{BufReader, BufWriter};
     use soketto::handshake;
-    use tokio_stream::wrappers::TcpListenerStream;
 
     #[test]
     fn bounds_matching() {
@@ -584,17 +751,152 @@ mod tests {
         async_rw::<MaybeTlsStream<TcpStream, TlsStream>>();
     }
 
+    #[test]
+    fn reorders_batch_responses_by_request_id() {
+        let (sender, receiver) = oneshot::channel();
+        let mut subscriptions = BTreeMap::new();
+        let mut pending = BTreeMap::from([(
+            1,
+            Pending {
+                ids: vec![1, 2],
+                sender,
+            },
+        )]);
+
+        handle_message(
+            br#"[{"jsonrpc":"2.0","id":2,"result":"second"},{"jsonrpc":"2.0","id":1,"result":"first"}]"#,
+            &mut subscriptions,
+            &mut pending,
+        )
+        .unwrap();
+
+        let response = futures::executor::block_on(receiver).unwrap().unwrap();
+        assert_eq!(
+            response,
+            vec![
+                Ok(rpc::Value::String("first".into())),
+                Ok(rpc::Value::String("second".into()))
+            ]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn rejects_duplicate_batch_response_ids() {
+        let (sender, _receiver) = oneshot::channel();
+        let mut subscriptions = BTreeMap::new();
+        let mut pending = BTreeMap::from([(
+            1,
+            Pending {
+                ids: vec![1, 2],
+                sender,
+            },
+        )]);
+        let result = handle_message(
+            br#"[{"jsonrpc":"2.0","id":1,"result":1},{"jsonrpc":"2.0","id":1,"result":2}]"#,
+            &mut subscriptions,
+            &mut pending,
+        );
+
+        assert!(matches!(result, Err(Error::InvalidResponse(message)) if message.contains("duplicate")));
+    }
+
+    #[test]
+    fn ignores_unrelated_notifications_and_rejects_malformed_subscriptions() {
+        let mut subscriptions = BTreeMap::new();
+        let mut pending = BTreeMap::new();
+        assert!(handle_message(
+            br#"{"jsonrpc":"2.0","method":"other_event","params":{"subscription":"0x1","result":1}}"#,
+            &mut subscriptions,
+            &mut pending,
+        )
+        .is_ok());
+
+        let result = handle_message(
+            br#"{"jsonrpc":"2.0","method":"eth_subscription","params":[]}"#,
+            &mut subscriptions,
+            &mut pending,
+        );
+        assert!(matches!(result, Err(Error::InvalidResponse(message)) if message.contains("not an object")));
+    }
+
+    #[test]
+    fn closes_backpressured_subscription() {
+        let id: SubscriptionId = "0x1".to_owned().into();
+        let (mut sink, _stream) = mpsc::channel(1);
+        while sink.try_send(rpc::Value::Null).is_ok() {}
+        let mut subscriptions = BTreeMap::from([(id.clone(), sink)]);
+        let mut pending = BTreeMap::new();
+
+        handle_message(
+            br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":1}}"#,
+            &mut subscriptions,
+            &mut pending,
+        )
+        .unwrap();
+
+        assert!(!subscriptions.contains_key(&id));
+    }
+
+    #[test]
+    fn reports_full_request_queue() {
+        let (mut requests, _task_requests) = mpsc::channel(1);
+        while requests
+            .try_send(TransportMessage::Unsubscribe {
+                id: "fill".to_owned().into(),
+            })
+            .is_ok()
+        {}
+        let websocket = WebSocket {
+            id: Arc::new(atomic::AtomicUsize::new(1)),
+            requests: Arc::new(parking_lot::Mutex::new(requests)),
+            channel_capacity: 1,
+        };
+
+        let result = websocket.unsubscribe("overflow".to_owned().into());
+
+        assert!(matches!(
+            result,
+            Err(Error::Transport(TransportError::Message(message))) if message.contains("queue is full")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_channel_capacity_before_connecting() {
+        let result = WebSocket::new_with_limits(
+            "ws://invalid.invalid",
+            DEFAULT_MAX_WS_RESPONSE_SIZE,
+            0,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::Transport(TransportError::Message(message))) if message.contains("greater than zero")
+        ));
+    }
+
+    #[cfg(not(any(feature = "ws-tls-tokio", feature = "ws-tls-async-io", feature = "ws-rustls-tokio")))]
+    #[tokio::test]
+    async fn rejects_wss_before_attempting_a_connection_without_tls() {
+        let result = WsServerTask::new("wss://invalid.invalid", DEFAULT_MAX_WS_RESPONSE_SIZE).await;
+        assert!(matches!(
+            result,
+            Err(Error::Transport(TransportError::Message(message))) if message.contains("requires")
+        ));
+    }
+
     #[tokio::test]
     async fn should_send_a_request() {
         let _ = env_logger::try_init();
         // given
-        let addr = "127.0.0.1:3000";
-        let listener = futures::executor::block_on(compat::TcpListener::bind(addr)).expect("Failed to bind");
+        let listener = futures::executor::block_on(compat::TcpListener::bind("127.0.0.1:0"))
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to read bound address").to_string();
         println!("Starting the server.");
-        tokio::spawn(server(listener, addr));
+        tokio::spawn(server(listener, addr.clone()));
 
-        let endpoint = "ws://127.0.0.1:3000";
-        let ws = WebSocket::new(endpoint).await.unwrap();
+        let ws = WebSocket::new(&format!("ws://{addr}")).await.unwrap();
 
         // when
         let res = ws.execute("eth_accounts", vec![rpc::Value::String("1".into())]);
@@ -603,36 +905,52 @@ mod tests {
         assert_eq!(res.await, Ok(rpc::Value::String("x".into())));
     }
 
-    async fn server(listener: compat::TcpListener, addr: &str) {
-        let mut incoming = TcpListenerStream::new(listener);
+    #[tokio::test]
+    async fn rejects_duplicate_outgoing_batch_ids() {
+        let listener = futures::executor::block_on(compat::TcpListener::bind("127.0.0.1:0"))
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to read bound address").to_string();
+        tokio::spawn(server(listener, addr.clone()));
+        let ws = WebSocket::new(&format!("ws://{addr}")).await.unwrap();
+        let calls = vec![
+            (7, helpers::build_request(7, "first", Vec::new())),
+            (7, helpers::build_request(7, "second", Vec::new())),
+        ];
+
+        assert!(matches!(
+            ws.send_batch(calls).await,
+            Err(Error::InvalidResponse(message)) if message.contains("duplicate request id")
+        ));
+    }
+
+    async fn server(listener: compat::TcpListener, addr: String) {
         println!("Listening on: {}", addr);
-        while let Some(Ok(socket)) = incoming.next().await {
-            let socket = compat::compat(socket);
-            let mut server = handshake::Server::new(BufReader::new(BufWriter::new(socket)));
-            let key = {
-                let req = server.receive_request().await.unwrap();
-                req.key()
-            };
-            let accept = handshake::server::Response::Accept { key, protocol: None };
-            server.send_response(&accept).await.unwrap();
-            let (mut sender, mut receiver) = server.into_builder().finish();
-            loop {
-                let mut data = Vec::new();
-                match receiver.receive_data(&mut data).await {
-                    Ok(data_type) if data_type.is_text() => {
-                        assert_eq!(
-                            std::str::from_utf8(&data),
-                            Ok(r#"{"jsonrpc":"2.0","method":"eth_accounts","params":["1"],"id":1}"#)
-                        );
-                        sender
-                            .send_text(r#"{"jsonrpc":"2.0","id":1,"result":"x"}"#)
-                            .await
-                            .unwrap();
-                        sender.flush().await.unwrap();
-                    }
-                    Err(soketto::connection::Error::Closed) => break,
-                    e => panic!("Unexpected data: {:?}", e),
+        let (socket, _) = listener.accept().await.unwrap();
+        let socket = compat::compat(socket);
+        let mut server = handshake::Server::new(BufReader::new(BufWriter::new(socket)));
+        let key = {
+            let req = server.receive_request().await.unwrap();
+            req.key()
+        };
+        let accept = handshake::server::Response::Accept { key, protocol: None };
+        server.send_response(&accept).await.unwrap();
+        let (mut sender, mut receiver) = server.into_builder().finish();
+        loop {
+            let mut data = Vec::new();
+            match receiver.receive_data(&mut data).await {
+                Ok(data_type) if data_type.is_text() => {
+                    assert_eq!(
+                        std::str::from_utf8(&data),
+                        Ok(r#"{"jsonrpc":"2.0","method":"eth_accounts","params":["1"],"id":1}"#)
+                    );
+                    sender
+                        .send_text(r#"{"jsonrpc":"2.0","id":1,"result":"x"}"#)
+                        .await
+                        .unwrap();
+                    sender.flush().await.unwrap();
                 }
+                Err(soketto::connection::Error::Closed) => break,
+                e => panic!("Unexpected data: {:?}", e),
             }
         }
     }

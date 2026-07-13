@@ -133,9 +133,9 @@ impl<T: Transport> Builder<T> {
                 gas: tx.gas.unwrap_or_else(|| 1_000_000.into()),
                 gas_price: tx.gas_price,
                 value: tx.value.unwrap_or_else(|| 0.into()),
-                data: tx
-                    .data
-                    .expect("Tried to deploy a contract but transaction data wasn't set"),
+                data: tx.data.ok_or_else(|| {
+                    error::Error::InvalidResponse("contract deployment transaction data was not set".into())
+                })?,
                 chain_id,
                 transaction_type: tx.transaction_type,
                 access_list: tx.access_list,

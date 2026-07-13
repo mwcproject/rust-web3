@@ -31,7 +31,12 @@ impl<T: Transport> ReverseResolver<T> {
         // See https://github.com/ensdomains/ens-contracts for up to date contracts.
         let bytes = include_bytes!("DefaultReverseResolver.json");
 
-        let contract = Contract::from_json(eth, resolver_addr, bytes).expect("Contract Creation Failed");
+        #[allow(
+            clippy::expect_used,
+            reason = "the ABI is embedded at compile time and validated by the test suite"
+        )]
+        let contract = Contract::from_json(eth, resolver_addr, bytes)
+            .expect("embedded DefaultReverseResolver ABI is valid");
 
         Self { contract }
     }

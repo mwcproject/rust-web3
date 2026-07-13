@@ -1,12 +1,5 @@
 //! Ethereum JSON-RPC client (Web3).
 
-#![allow(
-    clippy::type_complexity,
-    clippy::wrong_self_convention,
-    clippy::single_match,
-    clippy::let_unit_value,
-    clippy::match_wild_err_arm
-)]
 #![warn(missing_docs)]
 // select! in WS transport
 #![recursion_limit = "256"]
@@ -86,7 +79,7 @@ pub trait DuplexTransport: Transport {
 
 impl<X, T> Transport for X
 where
-    T: Transport + ?Sized,
+    T: Transport,
     X: std::ops::Deref<Target = T>,
     X: std::fmt::Debug,
     X: Clone,
@@ -104,7 +97,7 @@ where
 
 impl<X, T> BatchTransport for X
 where
-    T: BatchTransport + ?Sized,
+    T: BatchTransport,
     X: std::ops::Deref<Target = T>,
     X: std::fmt::Debug,
     X: Clone,
@@ -121,7 +114,7 @@ where
 
 impl<X, T> DuplexTransport for X
 where
-    T: DuplexTransport + ?Sized,
+    T: DuplexTransport,
     X: std::ops::Deref<Target = T>,
     X: std::fmt::Debug,
     X: Clone,

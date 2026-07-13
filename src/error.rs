@@ -44,6 +44,9 @@ pub enum Error {
     /// recovery error
     #[display("Recovery error: {}", _0)]
     Recovery(crate::signing::RecoveryError),
+    /// signing error
+    #[display("Signing error: {}", _0)]
+    Signing(crate::signing::SigningError),
     /// web3 internal error
     #[display("Internal Web3 error")]
     Internal,
@@ -61,6 +64,7 @@ impl std::error::Error for Error {
             Rpc(ref e) => Some(e),
             Io(ref e) => Some(e),
             Recovery(ref e) => Some(e),
+            Signing(ref e) => Some(e),
         }
     }
 }
@@ -80,8 +84,9 @@ impl Clone for Error {
             InvalidResponse(s) => InvalidResponse(s.clone()),
             Transport(s) => Transport(s.clone()),
             Rpc(e) => Rpc(e.clone()),
-            Io(e) => Io(IoError::from(e.kind())),
+            Io(e) => Io(IoError::new(e.kind(), e.to_string())),
             Recovery(e) => Recovery(e.clone()),
+            Signing(e) => Signing(e.clone()),
             Internal => Internal,
             Revert(s) => Revert(s.clone()),
         }
@@ -99,8 +104,22 @@ impl PartialEq for Error {
             (Rpc(a), Rpc(b)) => a == b,
             (Io(a), Io(b)) => a.kind() == b.kind(),
             (Recovery(a), Recovery(b)) => a == b,
+            (Signing(a), Signing(b)) => a == b,
             (Revert(a), Revert(b)) => a == b,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloning_io_error_preserves_context() {
+        let error = Error::Io(IoError::new(std::io::ErrorKind::InvalidData, "malformed response body"));
+        let cloned = error.clone();
+
+        assert!(cloned.to_string().contains("malformed response body"));
     }
 }

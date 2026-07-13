@@ -51,16 +51,22 @@ where
             Some(Ok(_)) => {
                 if let Some(confirmation_block_number) = check.check().await? {
                     let block_number = eth.block_number().await?;
-                    if confirmation_block_number.low_u64() + confirmations as u64 <= block_number.low_u64() {
+                    // Native supported targets have `usize` widths no greater than 64 bits.
+                    let required_block = confirmation_block_number
+                        .low_u64()
+                        .checked_add(confirmations as u64)
+                        .ok_or_else(|| {
+                            error::Error::InvalidResponse(format!(
+                                "confirmation height overflow: block {} plus {} confirmations",
+                                confirmation_block_number, confirmations
+                            ))
+                        })?;
+                    if required_block <= block_number.low_u64() {
                         return Ok(());
                     }
                 }
             }
-            Some(Err(e)) => {
-                return Err(error::Error::Transport(error::TransportError::Message(
-                    format!("Stream error: {e}").into(),
-                )));
-            }
+            Some(Err(e)) => return Err(e),
             None => {
                 return Err(error::Error::Transport(error::TransportError::Message(
                     "Stream ended unexpectedly".into(),
@@ -129,8 +135,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::send_transaction_with_confirmation;
+    use super::{send_transaction_with_confirmation, wait_for_confirmations};
     use crate::{
+        api::{Eth, EthFilter, Namespace},
         rpc::Value,
         transports::test::TestTransport,
         types::{Address, TransactionReceipt, TransactionRequest, H256, U64},
@@ -233,5 +240,31 @@ mod tests {
         );
         transport.assert_no_more_requests();
         assert_eq!(confirmation, Ok(transaction_receipt));
+    }
+
+    #[test]
+    fn confirmation_height_overflow_is_an_error() {
+        let mut transport = TestTransport::default();
+        transport.add_response(Value::String("0x1".into()));
+        transport.add_response(Value::Array(vec![Value::String(
+            "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
+        )]));
+        transport.add_response(Value::Array(vec![Value::String(
+            "0x0000000000000000000000000000000000000000000000000000000000000002".into(),
+        )]));
+        transport.add_response(Value::String("0x0".into()));
+
+        let result = futures::executor::block_on(wait_for_confirmations(
+            Eth::new(&transport),
+            EthFilter::new(&transport),
+            Duration::ZERO,
+            1,
+            || futures::future::ready(Ok(Some(U64::from(u64::MAX)))),
+        ));
+
+        assert!(
+            matches!(result, Err(crate::Error::InvalidResponse(ref message)) if message.contains("overflow")),
+            "unexpected result: {result:?}"
+        );
     }
 }

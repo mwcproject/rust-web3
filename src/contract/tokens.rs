@@ -4,7 +4,6 @@ use crate::{
     contract::error::Error,
     types::{Address, Bytes, BytesArray, H256, U128, U256},
 };
-use arrayvec::ArrayVec;
 use ethabi::{Token, Uint};
 
 /// Output type possible to deserialize from Contract ABI
@@ -16,15 +15,14 @@ pub trait Detokenize {
 }
 
 impl<T: Tokenizable> Detokenize for T {
-    fn from_tokens(mut tokens: Vec<Token>) -> Result<Self, Error> {
-        if tokens.len() != 1 {
-            Err(Error::InvalidOutputType(format!(
+    fn from_tokens(tokens: Vec<Token>) -> Result<Self, Error> {
+        let [token] = tokens.try_into().map_err(|tokens: Vec<Token>| {
+            Error::InvalidOutputType(format!(
                 "Expected single element, got a list: {:?}",
                 tokens
-            )))
-        } else {
-            Self::from_token(tokens.drain(..).next().expect("At least one element in vector; qed"))
-        }
+            ))
+        })?;
+        Self::from_token(token)
     }
 }
 
@@ -45,8 +43,12 @@ macro_rules! impl_output {
           )));
         }
         let mut it = tokens.drain(..);
+        // The exact-length guard proves every extraction is present; keep extraction
+        // fallible so future macro changes cannot turn malformed ABI output into a panic.
         Ok(($(
-          $ty::from_token(it.next().expect("All elements are in vector; qed"))?,
+          $ty::from_token(it.next().ok_or_else(|| Error::InvalidOutputType(
+            "Token list ended before all tuple elements were decoded".into()
+          ))?)?,
         )+))
       }
     }
@@ -75,7 +77,7 @@ pub trait Tokenize {
     fn into_tokens(self) -> Vec<Token>;
 }
 
-impl<'a> Tokenize for &'a [Token] {
+impl Tokenize for &[Token] {
     fn into_tokens(self) -> Vec<Token> {
         self.to_vec()
     }
@@ -174,14 +176,12 @@ impl Tokenizable for Bytes {
 impl Tokenizable for H256 {
     fn from_token(token: Token) -> Result<Self, Error> {
         match token {
-            Token::FixedBytes(mut s) => {
+            Token::FixedBytes(s) => {
                 if s.len() != 32 {
                     return Err(Error::InvalidOutputType(format!("Expected `H256`, got {:?}", s)));
                 }
                 let mut data = [0; 32];
-                for (idx, val) in s.drain(..).enumerate() {
-                    data[idx] = val;
-                }
+                data.copy_from_slice(&s);
                 Ok(data.into())
             }
             other => Err(Error::InvalidOutputType(format!("Expected `H256`, got {:?}", other))),
@@ -215,7 +215,10 @@ macro_rules! eth_uint_tokenizable {
                         let mut bytes = [0; 32];
                         data.to_big_endian(&mut bytes);
                         let data = U256::from_big_endian(&bytes);
-                        Ok(::std::convert::TryInto::try_into(data).unwrap())
+                        let converted = ::std::convert::TryInto::try_into(data).map_err(|_| {
+                            Error::InvalidOutputType(format!("ABI integer does not fit `{}`", $name))
+                        })?;
+                        Ok(converted)
                     }
                     other => Err(Error::InvalidOutputType(format!("Expected `{}`, got {:?}", $name, other)).into()),
                 }
@@ -232,12 +235,71 @@ macro_rules! eth_uint_tokenizable {
 eth_uint_tokenizable!(U256, "U256");
 eth_uint_tokenizable!(U128, "U128");
 
-macro_rules! int_tokenizable {
-    ($int: ident, $token: ident) => {
+macro_rules! signed_int_tokenizable {
+    ($int: ident) => {
         impl Tokenizable for $int {
             fn from_token(token: Token) -> Result<Self, Error> {
                 match token {
-                    Token::Int(data) | Token::Uint(data) => Ok(data.low_u128() as _),
+                    Token::Uint(data) => {
+                        let max = Uint::from(u128::from($int::MAX.unsigned_abs()));
+                        if data > max {
+                            return Err(Error::InvalidOutputType(format!(
+                                "ABI integer does not fit `{}`",
+                                stringify!($int)
+                            )));
+                        }
+                        $int::try_from(data.low_u128()).map_err(|_| {
+                            Error::InvalidOutputType(format!(
+                                "ABI integer does not fit `{}`",
+                                stringify!($int)
+                            ))
+                        })
+                    }
+                    Token::Int(data) => {
+                        let negative = data.bit(255);
+                        let max = Uint::from(u128::from($int::MAX.unsigned_abs()));
+                        let min_magnitude = Uint::from(u128::from($int::MIN.unsigned_abs()));
+                        if negative {
+                            // With bit 255 set, `!data` is at most 2^255 - 1, so adding one
+                            // cannot overflow this 256-bit value.
+                            let (magnitude, _) = (!data).overflowing_add(Uint::one());
+                            if magnitude > min_magnitude {
+                                return Err(Error::InvalidOutputType(format!(
+                                    "ABI integer does not fit `{}`",
+                                    stringify!($int)
+                                )));
+                            }
+                            if magnitude == min_magnitude {
+                                Ok($int::MIN)
+                            } else {
+                                let magnitude = $int::try_from(magnitude.low_u128()).map_err(|_| {
+                                    Error::InvalidOutputType(format!(
+                                        "ABI integer does not fit `{}`",
+                                        stringify!($int)
+                                    ))
+                                })?;
+                                // Equality with `MIN.unsigned_abs()` was handled above, so this
+                                // magnitude is at most `MAX` and negation cannot overflow.
+                                #[allow(
+                                    clippy::arithmetic_side_effects,
+                                    reason = "the minimum magnitude was handled, so this value is at most MAX"
+                                )]
+                                Ok(-magnitude)
+                            }
+                        } else if data > max {
+                            Err(Error::InvalidOutputType(format!(
+                                "ABI integer does not fit `{}`",
+                                stringify!($int)
+                            )))
+                        } else {
+                            $int::try_from(data.low_u128()).map_err(|_| {
+                                Error::InvalidOutputType(format!(
+                                    "ABI integer does not fit `{}`",
+                                    stringify!($int)
+                                ))
+                            })
+                        }
+                    }
                     other => Err(Error::InvalidOutputType(format!(
                         "Expected `{}`, got {:?}",
                         stringify!($int),
@@ -247,32 +309,63 @@ macro_rules! int_tokenizable {
             }
 
             fn into_token(self) -> Token {
-                // this should get optimized away by the compiler for unsigned integers
-                #[allow(unused_comparisons)]
                 let data = if self < 0 {
-                    // NOTE: Rust does sign extension when converting from a
-                    // signed integer to an unsigned integer, so:
-                    // `-1u8 as u128 == u128::max_value()`
-                    Uint::from(self as u128) | (Uint::MAX << 128)
+                    // Modular subtraction from zero constructs the canonical 256-bit
+                    // two's-complement representation; the underflow flag is intentional.
+                    Uint::zero()
+                        .overflowing_sub(Uint::from(u128::from(self.unsigned_abs())))
+                        .0
                 } else {
-                    self.into()
+                    Uint::from(u128::from(self.unsigned_abs()))
                 };
-                Token::$token(data)
+                Token::Int(data)
             }
         }
     };
 }
 
-int_tokenizable!(i8, Int);
-int_tokenizable!(i16, Int);
-int_tokenizable!(i32, Int);
-int_tokenizable!(i64, Int);
-int_tokenizable!(i128, Int);
-int_tokenizable!(u8, Uint);
-int_tokenizable!(u16, Uint);
-int_tokenizable!(u32, Uint);
-int_tokenizable!(u64, Uint);
-int_tokenizable!(u128, Uint);
+macro_rules! unsigned_int_tokenizable {
+    ($int: ident) => {
+        impl Tokenizable for $int {
+            fn from_token(token: Token) -> Result<Self, Error> {
+                match token {
+                    Token::Int(data) | Token::Uint(data) => {
+                        let max = Uint::from(u128::from($int::MAX));
+                        if data > max {
+                            return Err(Error::InvalidOutputType(format!(
+                                "ABI integer does not fit `{}`",
+                                stringify!($int)
+                            )));
+                        }
+                        $int::try_from(data.low_u128()).map_err(|_| {
+                            Error::InvalidOutputType(format!("ABI integer does not fit `{}`", stringify!($int)))
+                        })
+                    }
+                    other => Err(Error::InvalidOutputType(format!(
+                        "Expected `{}`, got {:?}",
+                        stringify!($int),
+                        other
+                    ))),
+                }
+            }
+
+            fn into_token(self) -> Token {
+                Token::Uint(Uint::from(u128::from(self)))
+            }
+        }
+    };
+}
+
+signed_int_tokenizable!(i8);
+signed_int_tokenizable!(i16);
+signed_int_tokenizable!(i32);
+signed_int_tokenizable!(i64);
+signed_int_tokenizable!(i128);
+unsigned_int_tokenizable!(u8);
+unsigned_int_tokenizable!(u16);
+unsigned_int_tokenizable!(u32);
+unsigned_int_tokenizable!(u64);
+unsigned_int_tokenizable!(u128);
 
 impl Tokenizable for bool {
     fn from_token(token: Token) -> Result<Self, Error> {
@@ -395,16 +488,19 @@ macro_rules! impl_fixed_types {
                             )));
                         }
 
-                        let mut arr = ArrayVec::<T, $num>::new();
-                        let mut it = tokens.into_iter().map(T::from_token);
-                        for _ in 0..$num {
-                            arr.push(it.next().expect("Length validated in guard; qed")?);
-                        }
-                        // Can't use expect here because [T; $num]: Debug is not satisfied.
-                        match arr.into_inner() {
-                            Ok(arr) => Ok(arr),
-                            Err(_) => panic!("All elements inserted so the array is full; qed"),
-                        }
+                        let values = tokens
+                            .into_iter()
+                            .map(T::from_token)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        // One decoded value is produced per validated input token. Keep the
+                        // conversion fallible instead of relying on that invariant with a panic.
+                        values.try_into().map_err(|values: Vec<T>| {
+                            Error::InvalidOutputType(format!(
+                                "Expected `FixedArray({})`, got FixedArray({})",
+                                $num,
+                                values.len()
+                            ))
+                        })
                     }
                     other => Err(
                         Error::InvalidOutputType(format!("Expected `FixedArray({})`, got {:?}", $num, other)).into(),
@@ -413,7 +509,7 @@ macro_rules! impl_fixed_types {
             }
 
             fn into_token(self) -> Token {
-                Token::FixedArray(ArrayVec::from(self).into_iter().map(T::into_token).collect())
+                Token::FixedArray(self.into_iter().map(T::into_token).collect())
             }
         }
 
@@ -516,6 +612,26 @@ mod tests {
 
         let uint128 = U128::MAX - 42;
         assert_eq!(U128::from_token(uint128.into_token()).unwrap(), uint128);
+    }
+
+    #[test]
+    fn should_reject_abi_integers_outside_the_requested_type() {
+        let above_u128 = Uint::from(1_u8) << 128;
+        assert!(U128::from_token(Token::Uint(above_u128)).is_err());
+        assert!(u64::from_token(Token::Uint(Uint::from(u64::MAX) + 1)).is_err());
+        assert!(i8::from_token(Token::Uint(Uint::MAX)).is_err());
+        assert!(i8::from_token(Token::Int(Uint::from(i8::MAX.unsigned_abs()) + 1)).is_err());
+
+        let below_i8_min = Uint::zero().overflowing_sub(Uint::from(i8::MIN.unsigned_abs()) + 1).0;
+        assert!(i8::from_token(Token::Int(below_i8_min)).is_err());
+    }
+
+    #[test]
+    fn should_decode_signed_abi_integer_boundaries() {
+        assert_eq!(i8::from_token(i8::MIN.into_token()).unwrap(), i8::MIN);
+        assert_eq!(i8::from_token(i8::MAX.into_token()).unwrap(), i8::MAX);
+        assert_eq!(i128::from_token(i128::MIN.into_token()).unwrap(), i128::MIN);
+        assert_eq!(i128::from_token(i128::MAX.into_token()).unwrap(), i128::MAX);
     }
 
     #[test]

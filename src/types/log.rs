@@ -38,16 +38,12 @@ pub struct Log {
 impl Log {
     /// Returns true if the log has been removed.
     pub fn is_removed(&self) -> bool {
-        match self.removed {
-            Some(val_removed) => return val_removed,
-            None => (),
+        if let Some(val_removed) = self.removed {
+            return val_removed;
         }
         match self.log_type {
-            Some(ref val_log_type) => {
-                if val_log_type == "removed" {
-                    return true;
-                }
-            }
+            Some(ref val_log_type) if val_log_type == "removed" => return true,
+            Some(_) => (),
             None => (),
         }
         false
@@ -65,10 +61,10 @@ where
     where
         S: Serializer,
     {
-        match self.0.len() {
-            0 => serializer.serialize_none(),
-            1 => Serialize::serialize(&self.0[0], serializer),
-            _ => Serialize::serialize(&self.0, serializer),
+        match self.0.as_slice() {
+            [] => serializer.serialize_none(),
+            [value] => Serialize::serialize(value, serializer),
+            values => Serialize::serialize(values, serializer),
         }
     }
 }

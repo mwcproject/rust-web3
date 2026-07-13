@@ -47,15 +47,15 @@ impl Recovery {
     {
         let bytes = raw_signature.as_ref();
 
-        if bytes.len() != 65 {
+        let (r, remainder) = bytes.split_first_chunk::<32>().ok_or(ParseSignatureError)?;
+        let (s, v) = remainder.split_first_chunk::<32>().ok_or(ParseSignatureError)?;
+        let [v] = v else {
             return Err(ParseSignatureError);
-        }
+        };
+        let r = H256::from_slice(r);
+        let s = H256::from_slice(s);
 
-        let v = bytes[64];
-        let r = H256::from_slice(&bytes[0..32]);
-        let s = H256::from_slice(&bytes[32..64]);
-
-        Ok(Recovery::new(message, v as _, r, s))
+        Ok(Recovery::new(message, u64::from(*v), r, s))
     }
 
     /// Retrieve the Recovery Id ("Standard V")
@@ -66,7 +66,7 @@ impl Recovery {
         match self.v {
             27 => Some(0),
             28 => Some(1),
-            v if v >= 35 => Some(((v - 1) % 2) as _),
+            v if v >= 35 => Some(if v.is_multiple_of(2) { 1 } else { 0 }),
             _ => None,
         }
     }
@@ -87,7 +87,7 @@ impl Recovery {
 
 impl<'a> From<&'a SignedData> for Recovery {
     fn from(signed: &'a SignedData) -> Self {
-        Recovery::new(signed.message_hash, signed.v as _, signed.r, signed.s)
+        Recovery::new(signed.message_hash, u64::from(signed.v), signed.r, signed.s)
     }
 }
 

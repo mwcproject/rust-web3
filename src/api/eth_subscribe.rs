@@ -73,7 +73,7 @@ impl<T: DuplexTransport, I> SubscriptionStream<T, I> {
 
     /// Unsubscribe from the event represented by this stream
     pub async fn unsubscribe(self) -> error::Result<bool> {
-        let &SubscriptionId(ref id) = &self.id;
+        let SubscriptionId(id) = &self.id;
         let id = helpers::serialize(&id);
         let response = self.transport.execute("eth_unsubscribe", vec![id]).await?;
         helpers::decode(response)
@@ -100,7 +100,10 @@ where
     T: DuplexTransport,
 {
     fn drop(self: Pin<&mut Self>) {
-        let _ = self.transport.unsubscribe(self.id().clone());
+        if let Err(error) = self.transport.unsubscribe(self.id().clone()) {
+            // Drop cannot propagate errors; log the failed cleanup instead of silently discarding it.
+            log::warn!("Failed to unsubscribe dropped stream {:?}: {}", self.id(), error);
+        }
     }
 }
 

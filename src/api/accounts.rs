@@ -48,7 +48,6 @@ mod accounts_signing {
         },
     };
     use rlp::RlpStream;
-    use std::convert::TryInto;
 
     const LEGACY_TX_ID: u64 = 0;
     const ACCESSLISTS_TX_ID: u64 = 1;
@@ -96,7 +95,7 @@ mod accounts_signing {
                 maybe!(tx.chain_id.map(U256::from), self.web3().eth().chain_id()),
             )
             .await?;
-            let chain_id = chain_id.as_u64();
+            let chain_id = u64::try_from(chain_id).map_err(|_| signing::SigningError::InvalidChainId)?;
 
             let max_priority_fee_per_gas = match tx.transaction_type {
                 Some(tx_type) if tx_type == U64::from(EIP1559_TX_ID) => {
@@ -117,7 +116,7 @@ mod accounts_signing {
                 max_priority_fee_per_gas,
             };
 
-            let signed = tx.sign(key, chain_id);
+            let signed = tx.sign(key, chain_id)?;
             Ok(signed)
         }
 
@@ -128,20 +127,19 @@ mod accounts_signing {
         /// notation, that is the recovery value `v` is either `27` or `28` (as
         /// opposed to the standard notation where `v` is either `0` or `1`). This
         /// is important to consider when using this signature with other crates.
-        pub fn sign<S>(&self, message: S, key: impl signing::Key) -> SignedData
+        pub fn sign<S>(&self, message: S, key: impl signing::Key) -> Result<SignedData, signing::SigningError>
         where
             S: AsRef<[u8]>,
         {
             let message = message.as_ref();
             let message_hash = self.hash_message(message);
 
-            let signature = key
-                .sign(message_hash.as_bytes(), None)
-                .expect("hash is non-zero 32-bytes; qed");
-            let v = signature
-                .v
-                .try_into()
-                .expect("signature recovery in electrum notation always fits in a u8");
+            let signature = key.sign(message_hash.as_bytes(), None)?;
+            let v = u8::try_from(signature.v).map_err(|_| signing::SigningError::InvalidRecoveryId)?;
+            if !matches!(v, 27 | 28) {
+                return Err(signing::SigningError::InvalidRecoveryId);
+            }
+            signing::validate_signature(&signature)?;
 
             let signature_bytes = Bytes({
                 let mut bytes = Vec::with_capacity(65);
@@ -154,14 +152,14 @@ mod accounts_signing {
             // We perform this allocation only after all previous fallible actions have completed successfully.
             let message = message.to_owned();
 
-            SignedData {
+            Ok(SignedData {
                 message,
                 message_hash,
                 v,
                 r: signature.r,
                 s: signature.s,
                 signature: signature_bytes,
-            }
+            })
         }
 
         /// Recovers the Ethereum address which was used to sign the given data.
@@ -296,72 +294,133 @@ mod accounts_signing {
             }
         }
 
-        fn encode(&self, chain_id: u64, signature: Option<&Signature>) -> Vec<u8> {
+        fn encode(&self, chain_id: u64, signature: Option<&Signature>) -> Result<Vec<u8>, signing::SigningError> {
             match self.transaction_type.map(|t| t.as_u64()) {
                 Some(LEGACY_TX_ID) | None => {
                     let stream = self.encode_legacy(chain_id, signature);
-                    stream.out().to_vec()
+                    Ok(stream.out().to_vec())
                 }
 
                 Some(ACCESSLISTS_TX_ID) => {
-                    let tx_id: u8 = ACCESSLISTS_TX_ID as u8;
+                    // EIP-2930 assigns the single-byte envelope type 1.
+                    let tx_id = 1_u8;
                     let stream = self.encode_access_list_payload(chain_id, signature);
-                    [&[tx_id], stream.as_raw()].concat()
+                    Ok([&[tx_id], stream.as_raw()].concat())
                 }
 
                 Some(EIP1559_TX_ID) => {
-                    let tx_id: u8 = EIP1559_TX_ID as u8;
+                    // EIP-1559 assigns the single-byte envelope type 2.
+                    let tx_id = 2_u8;
                     let stream = self.encode_eip1559_payload(chain_id, signature);
-                    [&[tx_id], stream.as_raw()].concat()
+                    Ok([&[tx_id], stream.as_raw()].concat())
                 }
 
-                _ => {
-                    panic!("Unsupported transaction type");
-                }
+                Some(transaction_type) => Err(signing::SigningError::UnsupportedTransactionType(transaction_type)),
             }
         }
 
         /// Sign and return a raw signed transaction.
-        pub fn sign(self, sign: impl signing::Key, chain_id: u64) -> SignedTransaction {
+        pub fn sign(
+            self,
+            sign: impl signing::Key,
+            chain_id: u64,
+        ) -> Result<SignedTransaction, signing::SigningError> {
             let adjust_v_value = matches!(self.transaction_type.map(|t| t.as_u64()), Some(LEGACY_TX_ID) | None);
 
-            let encoded = self.encode(chain_id, None);
+            let legacy_recovery_base = if adjust_v_value {
+                Some(
+                    chain_id
+                        .checked_mul(2)
+                        .and_then(|value| value.checked_add(35))
+                        .ok_or(signing::SigningError::InvalidChainId)?,
+                )
+            } else {
+                None
+            };
+
+            let encoded = self.encode(chain_id, None)?;
 
             let hash = signing::keccak256(encoded.as_ref());
 
             let signature = if adjust_v_value {
-                sign.sign(&hash, Some(chain_id))
-                    .expect("hash is non-zero 32-bytes; qed")
+                sign.sign(&hash, Some(chain_id))?
             } else {
-                sign.sign_message(&hash).expect("hash is non-zero 32-bytes; qed")
+                sign.sign_message(&hash)?
             };
+            match legacy_recovery_base {
+                Some(first) => {
+                    let second = first.checked_add(1);
+                    if signature.v != first && second != Some(signature.v) {
+                        return Err(signing::SigningError::InvalidRecoveryId);
+                    }
+                }
+                None if signature.v > 1 => return Err(signing::SigningError::InvalidRecoveryId),
+                _ => {}
+            }
+            signing::validate_signature(&signature)?;
 
-            let signed = self.encode(chain_id, Some(&signature));
+            let signed = self.encode(chain_id, Some(&signature))?;
             let transaction_hash = signing::keccak256(signed.as_ref()).into();
 
-            SignedTransaction {
+            Ok(SignedTransaction {
                 message_hash: hash.into(),
                 v: signature.v,
                 r: signature.r,
                 s: signature.s,
                 raw_transaction: signed.into(),
                 transaction_hash,
-            }
+            })
         }
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "signing", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::{
-        signing::{SecretKey, SecretKeyRef},
+        signing::{Key, SecretKey, SecretKeyRef, Signature, SigningError},
         transports::test::TestTransport,
-        types::{Address, Recovery, SignedTransaction, TransactionParameters, U256},
+        types::{AccessListItem, Address, Recovery, SignedTransaction, TransactionParameters, U256},
     };
     use accounts_signing::*;
     use hex_literal::hex;
     use serde_json::json;
+
+    struct FailingKey;
+
+    impl Key for FailingKey {
+        fn sign(&self, _: &[u8], _: Option<u64>) -> Result<Signature, SigningError> {
+            Err(SigningError::InvalidMessage)
+        }
+
+        fn sign_message(&self, _: &[u8]) -> Result<Signature, SigningError> {
+            Err(SigningError::InvalidMessage)
+        }
+
+        fn address(&self) -> Address {
+            Address::zero()
+        }
+    }
+
+    struct StubSignatureKey(u64);
+
+    impl Key for StubSignatureKey {
+        fn sign(&self, _: &[u8], _: Option<u64>) -> Result<Signature, SigningError> {
+            Ok(Signature {
+                v: self.0,
+                r: H256::zero(),
+                s: H256::zero(),
+            })
+        }
+
+        fn sign_message(&self, message: &[u8]) -> Result<Signature, SigningError> {
+            self.sign(message, None)
+        }
+
+        fn address(&self) -> Address {
+            Address::zero()
+        }
+    }
 
     #[test]
     fn accounts_sign_transaction() {
@@ -374,7 +433,7 @@ mod tests {
             gas: 2_000_000.into(),
             ..Default::default()
         };
-        let key = SecretKey::from_slice(&hex!(
+        let key = SecretKey::from_byte_array(hex!(
             "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
         ))
         .unwrap();
@@ -415,7 +474,7 @@ mod tests {
 
     #[test]
     fn accounts_sign_transaction_with_all_parameters() {
-        let key = SecretKey::from_slice(&hex!(
+        let key = SecretKey::from_byte_array(hex!(
             "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         ))
         .unwrap();
@@ -434,6 +493,145 @@ mod tests {
 
         // sign_transaction makes no requests when all parameters are specified
         accounts.transport().assert_no_more_requests();
+    }
+
+    #[test]
+    fn signing_errors_are_propagated() {
+        let transport = TestTransport::default();
+        let accounts = Accounts::new(&transport);
+        assert_eq!(accounts.sign("message", FailingKey), Err(SigningError::InvalidMessage));
+        for invalid_v in [29, u64::from(u8::MAX) + 1] {
+            assert_eq!(
+                accounts.sign("message", StubSignatureKey(invalid_v)),
+                Err(SigningError::InvalidRecoveryId)
+            );
+        }
+        assert_eq!(
+            accounts.sign("message", StubSignatureKey(27)),
+            Err(SigningError::InvalidSignature)
+        );
+
+        let result = futures::executor::block_on(accounts.sign_transaction(
+            TransactionParameters {
+                nonce: Some(0.into()),
+                gas_price: Some(1.into()),
+                chain_id: Some(1),
+                ..Default::default()
+            },
+            FailingKey,
+        ));
+        assert_eq!(result, Err(crate::Error::Signing(SigningError::InvalidMessage)));
+
+        for (transaction_type, invalid_v) in [(None, 29), (Some(2.into()), 2)] {
+            let result = futures::executor::block_on(accounts.sign_transaction(
+                TransactionParameters {
+                    nonce: Some(0.into()),
+                    gas_price: Some(1.into()),
+                    chain_id: Some(1),
+                    transaction_type,
+                    ..Default::default()
+                },
+                StubSignatureKey(invalid_v),
+            ));
+            assert_eq!(result, Err(crate::Error::Signing(SigningError::InvalidRecoveryId)));
+        }
+        for (transaction_type, recovery_v) in [(None, 37), (Some(2.into()), 0)] {
+            let result = futures::executor::block_on(accounts.sign_transaction(
+                TransactionParameters {
+                    nonce: Some(0.into()),
+                    gas_price: Some(1.into()),
+                    chain_id: Some(1),
+                    transaction_type,
+                    ..Default::default()
+                },
+                StubSignatureKey(recovery_v),
+            ));
+            assert_eq!(result, Err(crate::Error::Signing(SigningError::InvalidSignature)));
+        }
+        transport.assert_no_more_requests();
+    }
+
+    #[test]
+    fn rejects_oversized_rpc_chain_id() {
+        let key = SecretKey::from_byte_array([1_u8; 32]).unwrap();
+        let oversized_chain_id = U256::from(u64::MAX) + 1;
+        let mut transport = TestTransport::default();
+        transport.add_response(json!(oversized_chain_id));
+        let accounts = Accounts::new(&transport);
+
+        let result = futures::executor::block_on(accounts.sign_transaction(
+            TransactionParameters {
+                nonce: Some(0.into()),
+                gas_price: Some(1.into()),
+                chain_id: None,
+                ..Default::default()
+            },
+            &key,
+        ));
+
+        assert!(matches!(result, Err(crate::Error::Signing(SigningError::InvalidChainId))));
+        transport.assert_request("eth_chainId", &[]);
+        transport.assert_no_more_requests();
+    }
+
+    #[test]
+    fn rejects_chain_id_arithmetic_overflow_and_unsupported_transaction_type() {
+        let key = SecretKey::from_byte_array([1_u8; 32]).unwrap();
+        assert!(matches!(
+            SecretKeyRef::new(&key).sign(&[1_u8; 32], Some(u64::MAX)),
+            Err(SigningError::InvalidChainId)
+        ));
+        let standard_v = SecretKeyRef::new(&key).sign_message(&[1_u8; 32]).unwrap().v;
+        let largest_valid_chain_id = (u64::MAX - 35 - standard_v) / 2;
+        assert!(SecretKeyRef::new(&key)
+            .sign(&[1_u8; 32], Some(largest_valid_chain_id))
+            .is_ok());
+        assert!(matches!(
+            SecretKeyRef::new(&key).sign(&[1_u8; 32], largest_valid_chain_id.checked_add(1)),
+            Err(SigningError::InvalidChainId)
+        ));
+
+        let tx = Transaction {
+            to: None,
+            nonce: 0.into(),
+            gas: 21_000.into(),
+            gas_price: 1.into(),
+            value: 0.into(),
+            data: Vec::new(),
+            transaction_type: Some(3.into()),
+            access_list: Vec::new(),
+            max_priority_fee_per_gas: 0.into(),
+        };
+        assert_eq!(
+            tx.sign(&key, 1),
+            Err(SigningError::UnsupportedTransactionType(3))
+        );
+    }
+
+    #[test]
+    fn typed_transactions_preserve_their_envelope_and_rlp_shape() {
+        let key = SecretKey::from_byte_array([1_u8; 32]).unwrap();
+        for (transaction_type, expected_fields) in [(1_u64, 11_usize), (2, 12)] {
+            let tx = Transaction {
+                to: Some(Address::from_low_u64_be(1)),
+                nonce: 2.into(),
+                gas: 21_000.into(),
+                gas_price: 3.into(),
+                value: 4.into(),
+                data: vec![5],
+                transaction_type: Some(transaction_type.into()),
+                access_list: vec![AccessListItem {
+                    address: Address::from_low_u64_be(6),
+                    storage_keys: vec![H256::from_low_u64_be(7)],
+                }],
+                max_priority_fee_per_gas: 1.into(),
+            };
+
+            let signed = tx.sign(&key, 1).unwrap();
+            let (envelope, payload) = signed.raw_transaction.0.split_first().unwrap();
+            assert_eq!(*envelope, u8::try_from(transaction_type).unwrap());
+            assert_eq!(rlp::Rlp::new(payload).item_count(), Ok(expected_fields));
+        }
     }
 
     #[test]
@@ -460,11 +658,11 @@ mod tests {
 
         let accounts = Accounts::new(TestTransport::default());
 
-        let key = SecretKey::from_slice(&hex!(
+        let key = SecretKey::from_byte_array(hex!(
             "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
         ))
         .unwrap();
-        let signed = accounts.sign("Some data", SecretKeyRef::new(&key));
+        let signed = accounts.sign("Some data", SecretKeyRef::new(&key)).unwrap();
 
         assert_eq!(
             signed.message_hash,
@@ -502,7 +700,7 @@ mod tests {
 
     #[test]
     fn accounts_recover_signed() {
-        let key = SecretKey::from_slice(&hex!(
+        let key = SecretKey::from_byte_array(hex!(
             "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         ))
         .unwrap();
@@ -510,7 +708,7 @@ mod tests {
 
         let accounts = Accounts::new(TestTransport::default());
 
-        let signed = accounts.sign("rust-web3 rocks!", &key);
+        let signed = accounts.sign("rust-web3 rocks!", &key).unwrap();
         let recovered = accounts.recover(&signed).unwrap();
         assert_eq!(recovered, address);
 
@@ -547,13 +745,13 @@ mod tests {
             access_list: vec![],
             max_priority_fee_per_gas: 0.into(),
         };
-        let skey = SecretKey::from_slice(&hex!(
+        let skey = SecretKey::from_byte_array(hex!(
             "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
         ))
         .unwrap();
         let key = SecretKeyRef::new(&skey);
 
-        let signed = tx.sign(key, 1);
+        let signed = tx.sign(key, 1).unwrap();
 
         let expected = SignedTransaction {
             message_hash: hex!("6893a6ee8df79b0f5d64a180cd1ef35d030f3e296a5361cf04d02ce720d32ec5").into(),

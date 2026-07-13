@@ -4,20 +4,23 @@ use crate::{
     error::{Error, Result, TransportError},
     helpers, BatchTransport, RequestId, Transport,
 };
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 use futures::future::BoxFuture;
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 use futures::future::LocalBoxFuture as BoxFuture;
+use futures::StreamExt;
 use jsonrpc_core::types::{Call, Output, Request, Value};
 use reqwest::{Client, Url};
 use serde::de::DeserializeOwned;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::AtomicUsize,
         Arc,
     },
 };
+
+const DEFAULT_MAX_HTTP_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
 
 /// HTTP Transport
 #[derive(Clone, Debug)]
@@ -31,6 +34,7 @@ pub struct Http {
 struct Inner {
     url: Url,
     id: AtomicUsize,
+    max_response_size: usize,
 }
 
 impl Http {
@@ -38,42 +42,68 @@ impl Http {
     ///
     /// Note that the http [Client] automatically enables some features like setting the basic auth
     /// header or enabling a proxy from the environment. You can customize it with
-    /// [Http::with_client].
+    /// [Http::with_client]. Responses are limited to 16 MiB by default; use
+    /// [Http::new_with_max_response_size] to choose another bound.
     pub fn new(url: &str) -> Result<Self> {
-        #[allow(unused_mut)]
+        Self::new_with_max_response_size(url, DEFAULT_MAX_HTTP_RESPONSE_SIZE)
+    }
+
+    /// Create a new HTTP transport with a configurable maximum response size in bytes.
+    pub fn new_with_max_response_size(url: &str, max_response_size: usize) -> Result<Self> {
+        #[allow(unused_mut, reason = "the wasm configuration omits the native user-agent mutation")]
         let mut builder = Client::builder();
-        #[cfg(not(feature = "wasm"))]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             builder = builder.user_agent(reqwest::header::HeaderValue::from_static("web3.rs"));
         }
         let client = builder
             .build()
             .map_err(|err| Error::Transport(TransportError::Message(format!("failed to build client: {}", err))))?;
-        Ok(Self::with_client(client, url.parse()?))
+        Ok(Self::with_client_and_max_response_size(
+            client,
+            url.parse()?,
+            max_response_size,
+        ))
     }
 
     /// Like `new` but with a user provided client instance.
     pub fn with_client(client: Client, url: Url) -> Self {
+        Self::with_client_and_max_response_size(client, url, DEFAULT_MAX_HTTP_RESPONSE_SIZE)
+    }
+
+    /// Like [`Http::with_client`], with a configurable maximum response size in bytes.
+    pub fn with_client_and_max_response_size(client: Client, url: Url, max_response_size: usize) -> Self {
         Self {
             client,
             inner: Arc::new(Inner {
                 url,
                 id: AtomicUsize::new(0),
+                max_response_size,
             }),
         }
     }
 
     fn next_id(&self) -> RequestId {
-        self.inner.id.fetch_add(1, Ordering::AcqRel)
+        helpers::next_request_id(&self.inner.id)
     }
 
-    fn new_request(&self) -> (Client, Url) {
-        (self.client.clone(), self.inner.url.clone())
+    fn new_request(&self) -> (Client, Url, usize) {
+        (
+            self.client.clone(),
+            self.inner.url.clone(),
+            self.inner.max_response_size,
+        )
     }
 }
 
-// Id is only used for logging.
-async fn execute_rpc<T: DeserializeOwned>(client: &Client, url: Url, request: &Request, id: RequestId) -> Result<T> {
+// The id is used for logging and response correlation.
+async fn execute_rpc<T: DeserializeOwned>(
+    client: &Client,
+    url: Url,
+    request: &Request,
+    id: RequestId,
+    max_response_size: usize,
+) -> Result<T> {
     log::debug!("[id:{}] sending request: {:?}", id, serde_json::to_string(&request)?);
     let response = client
         .post(url)
@@ -82,12 +112,35 @@ async fn execute_rpc<T: DeserializeOwned>(client: &Client, url: Url, request: &R
         .await
         .map_err(|err| Error::Transport(TransportError::Message(format!("failed to send request: {}", err))))?;
     let status = response.status();
-    let response = response.bytes().await.map_err(|err| {
-        Error::Transport(TransportError::Message(format!(
-            "failed to read response bytes: {}",
-            err
-        )))
-    })?;
+    if response
+        .content_length()
+        // Native supported targets have pointer widths no greater than 64 bits.
+        .is_some_and(|length| length > max_response_size as u64)
+    {
+        return Err(Error::Transport(TransportError::Message(format!(
+            "HTTP response exceeded {max_response_size} bytes"
+        ))));
+    }
+    let mut response_stream = response.bytes_stream();
+    let mut response = Vec::new();
+    while let Some(chunk) = response_stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            Error::Transport(TransportError::Message(format!("failed to read response bytes: {err}")))
+        })?;
+        // Allocated buffers and slices are each bounded by `isize::MAX`; their lengths sum to
+        // at most `usize::MAX - 1`, so this addition cannot overflow a supported native target.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "two allocated object lengths sum to less than usize::MAX"
+        )]
+        let response_len = response.len() + chunk.len();
+        if response_len > max_response_size {
+            return Err(Error::Transport(TransportError::Message(format!(
+                "HTTP response exceeded {max_response_size} bytes"
+            ))));
+        }
+        response.extend_from_slice(&chunk);
+    }
     log::debug!(
         "[id:{}] received response: {:?}",
         id,
@@ -117,12 +170,22 @@ impl Transport for Http {
     }
 
     fn send(&self, id: RequestId, call: Call) -> Self::Out {
-        let (client, url) = self.new_request();
+        let (client, url, max_response_size) = self.new_request();
         Box::pin(async move {
-            let output: Output = execute_rpc(&client, url, &Request::Single(call), id).await?;
-            helpers::to_result_from_output(output)
+            let output: Output = execute_rpc(&client, url, &Request::Single(call), id, max_response_size).await?;
+            handle_single_response(id, output)
         })
     }
+}
+
+fn handle_single_response(expected_id: RequestId, output: Output) -> Result<Value> {
+    let response_id = id_of_output(&output)?;
+    if response_id != expected_id {
+        return Err(Error::InvalidResponse(format!(
+            "response id {response_id} does not match request id {expected_id}"
+        )));
+    }
+    helpers::to_result_from_output(output)
 }
 
 impl BatchTransport for Http {
@@ -134,10 +197,10 @@ impl BatchTransport for Http {
     {
         // Batch calls don't need an id but it helps associate the response log with the request log.
         let id = self.next_id();
-        let (client, url) = self.new_request();
+        let (client, url, max_response_size) = self.new_request();
         let (ids, calls): (Vec<_>, Vec<_>) = requests.into_iter().unzip();
         Box::pin(async move {
-            let value = execute_rpc(&client, url, &Request::Batch(calls), id).await?;
+            let value = execute_rpc(&client, url, &Request::Batch(calls), id, max_response_size).await?;
             let outputs = handle_possible_error_object_for_batched_request(value)?;
             handle_batch_response(&ids, outputs)
         })
@@ -184,7 +247,8 @@ fn id_of_output(output: &Output) -> Result<RequestId> {
         Output::Failure(failure) => &failure.id,
     };
     match id {
-        jsonrpc_core::Id::Num(num) => Ok(*num as RequestId),
+        jsonrpc_core::Id::Num(num) => RequestId::try_from(*num)
+            .map_err(|_| Error::InvalidResponse(format!("response id {num} does not fit RequestId"))),
         _ => Err(Error::InvalidResponse("response id is not u64".to_string())),
     }
 }
@@ -213,7 +277,7 @@ mod tests {
         let body = body.collect().await?.to_bytes().to_vec();
         content.extend(body);
 
-        assert_eq!(std::str::from_utf8(&*content), Ok(expected));
+        assert_eq!(std::str::from_utf8(&content), Ok(expected));
 
         Ok(hyper::Response::new(Full::new(Bytes::from(response))))
     }
@@ -307,6 +371,116 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejects_oversized_advertised_response() {
+        use hyper::service::service_fn;
+        use hyper_util::{
+            rt::{TokioExecutor, TokioIo},
+            server::conn::auto,
+        };
+        use tokio::net::TcpListener;
+
+        async fn handler(_req: hyper::Request<hyper::body::Incoming>) -> hyper::Result<hyper::Response<Full<Bytes>>> {
+            Ok(hyper::Response::new(Full::new(Bytes::from(vec![b' '; 33]))))
+        }
+
+        let addr = format!("127.0.0.1:{}", get_available_port().unwrap());
+        let listener = TcpListener::bind(addr.clone()).await.unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            auto::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service_fn(handler))
+                .await
+                .unwrap();
+        });
+
+        let client = Http::with_client_and_max_response_size(
+            Client::new(),
+            format!("http://{addr}").parse().unwrap(),
+            32,
+        );
+        let result = client.execute("eth_getAccounts", vec![]).await;
+        assert!(matches!(
+            result,
+            Err(Error::Transport(TransportError::Message(ref message))) if message.contains("exceeded")
+        ), "unexpected result: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_chunked_response() {
+        use http_body_util::StreamBody;
+        use hyper::{body::Frame, service::service_fn};
+        use hyper_util::{
+            rt::{TokioExecutor, TokioIo},
+            server::conn::auto,
+        };
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        async fn handler(
+            _req: hyper::Request<hyper::body::Incoming>,
+        ) -> hyper::Result<
+            hyper::Response<StreamBody<impl futures::Stream<Item = std::result::Result<Frame<Bytes>, Infallible>>>>,
+        > {
+            let chunks = [Bytes::from(vec![b' '; 20]), Bytes::from(vec![b' '; 20])];
+            let body = StreamBody::new(futures::stream::iter(chunks.map(|chunk| Ok(Frame::data(chunk)))));
+            Ok(hyper::Response::new(body))
+        }
+
+        let addr = format!("127.0.0.1:{}", get_available_port().unwrap());
+        let listener = TcpListener::bind(addr.clone()).await.unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            auto::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service_fn(handler))
+                .await
+                .unwrap();
+        });
+
+        let client = Http::with_client_and_max_response_size(
+            Client::new(),
+            format!("http://{addr}").parse().unwrap(),
+            32,
+        );
+        let result = client.execute("eth_getAccounts", vec![]).await;
+        assert!(matches!(
+            result,
+            Err(Error::Transport(TransportError::Message(ref message))) if message.contains("exceeded 32 bytes")
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepts_response_at_exact_size_limit() {
+        use hyper::service::service_fn;
+        use hyper_util::{
+            rt::{TokioExecutor, TokioIo},
+            server::conn::auto,
+        };
+        use tokio::net::TcpListener;
+
+        const RESPONSE: &str = r#"{"jsonrpc":"2.0","id":0,"result":"x"}"#;
+        async fn handler(_req: hyper::Request<hyper::body::Incoming>) -> hyper::Result<hyper::Response<Full<Bytes>>> {
+            Ok(hyper::Response::new(Full::new(Bytes::from_static(RESPONSE.as_bytes()))))
+        }
+
+        let addr = format!("127.0.0.1:{}", get_available_port().unwrap());
+        let listener = TcpListener::bind(addr.clone()).await.unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            auto::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service_fn(handler))
+                .await
+                .unwrap();
+        });
+
+        let client = Http::with_client_and_max_response_size(
+            Client::new(),
+            format!("http://{addr}").parse().unwrap(),
+            RESPONSE.len(),
+        );
+        assert_eq!(client.execute("eth_getAccounts", vec![]).await, Ok(Value::String("x".into())));
+    }
+
     #[test]
     fn handles_batch_response_being_in_different_order_than_input() {
         let ids = vec![0, 1, 2];
@@ -328,5 +502,40 @@ mod tests {
             .collect::<Vec<_>>();
         // The order of the ids should have been restored.
         assert_eq!(ids, results);
+    }
+
+    #[test]
+    fn rejects_single_response_with_wrong_id() {
+        let output = Output::Success(jsonrpc_core::Success {
+            jsonrpc: Some(jsonrpc_core::Version::V2),
+            result: Value::String("wrong request".into()),
+            id: jsonrpc_core::Id::Num(2),
+        });
+
+        assert!(matches!(
+            handle_single_response(1, output),
+            Err(Error::InvalidResponse(message)) if message.contains("does not match")
+        ));
+    }
+
+    #[test]
+    fn request_ids_are_unique_across_threads() {
+        let transport = Http::new("http://127.0.0.1").unwrap();
+        let threads = (0..4)
+            .map(|_| {
+                let transport = transport.clone();
+                std::thread::spawn(move || {
+                    (0..256)
+                        .map(|_| transport.prepare("test", Vec::new()).0)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(ids.len(), 1_024);
     }
 }

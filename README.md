@@ -132,11 +132,13 @@ The library supports following features:
 - `ws-tokio` - Enables WS transport using `tokio` runtime.
 - `ws-tls-tokio` - Enables TLS support for WS transport (implies `ws-tokio`; default).
 - `ws-rustls-tokio` - Enables rustls TLS support for WS transport (implies `ws-tokio`).
-- `ws-async-std` - Enables WS transport using `async-std` runtime.
-- `ws-tls-async-std` - Enables TLS support for WS transport (implies `ws-async-std`).
+- `ws-async-io` - Enables WS transport using the maintained async-io runtime stack.
+- `ws-async-std` - Compatibility alias for `ws-async-io`.
+- `ws-tls-async-io` - Enables TLS support for async-io WS transport (implies `ws-async-io`).
+- `ws-tls-async-std` - Compatibility alias for `ws-tls-async-io`.
 - `ipc-tokio` - Enables IPC transport using `tokio` runtime (default).
 - `signing` - Enable account namespace and local-signing support (default).
-- `eip-1193` - Enable EIP-1193 support.
+- `eip-1193` - Enable EIP-1193 support on `wasm32` targets.
 - `wasm` - Compile for WASM (make sure to disable default features).
 - `arbitrary_precision` - Enable `arbitrary_precision` in `serde_json`.
 - `allow-missing-fields` - Some response fields are mandatory in Ethereum but not present in

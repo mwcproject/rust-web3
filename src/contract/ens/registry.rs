@@ -28,12 +28,20 @@ pub struct Registry<T: Transport> {
 impl<T: Transport> Registry<T> {
     /// Creates new instance of [`Registry`].
     pub fn new(eth: Eth<T>) -> Self {
-        let address = ENS_REGISTRY_ADDRESS.parse().expect("Parsing Address");
+        #[allow(
+            clippy::expect_used,
+            reason = "the ENS registry address is a fixed compile-time constant"
+        )]
+        let address = ENS_REGISTRY_ADDRESS.parse().expect("embedded ENS registry address is valid");
 
         // See https://github.com/ensdomains/ens-contracts for up to date contracts.
         let json = include_bytes!("ENSRegistry.json");
 
-        let contract = Contract::from_json(eth, address, json).expect("Contract Creation");
+        #[allow(
+            clippy::expect_used,
+            reason = "the ABI is embedded at compile time and validated by the test suite"
+        )]
+        let contract = Contract::from_json(eth, address, json).expect("embedded ENSRegistry ABI is valid");
 
         Self { contract }
     }

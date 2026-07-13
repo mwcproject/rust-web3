@@ -40,7 +40,11 @@ impl<T: Transport> PublicResolver<T> {
         // See https://github.com/ensdomains/ens-contracts for up to date contracts.
         let bytes = include_bytes!("PublicResolver.json");
 
-        let contract = Contract::from_json(eth, resolver_addr, bytes).expect("Contract Creation");
+        #[allow(
+            clippy::expect_used,
+            reason = "the ABI is embedded at compile time and validated by the test suite"
+        )]
+        let contract = Contract::from_json(eth, resolver_addr, bytes).expect("embedded PublicResolver ABI is valid");
 
         Self { contract }
     }

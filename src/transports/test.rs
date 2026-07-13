@@ -50,6 +50,12 @@ impl TestTransport {
     }
 
     /// Assert request
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "this test-only assertion helper intentionally panics on exhausted requests, counter overflow, or invalid JSON"
+    )]
     pub fn assert_request(&mut self, method: &str, params: &[String]) {
         let idx = self.asserted;
         self.asserted += 1;
@@ -63,11 +69,12 @@ impl TestTransport {
     /// Assert no more requests
     pub fn assert_no_more_requests(&self) {
         let requests = self.requests.borrow();
+        let unexpected = requests.get(self.asserted..).unwrap_or_default();
         assert_eq!(
             self.asserted,
             requests.len(),
             "Expected no more requests, got: {:?}",
-            &requests[self.asserted..]
+            unexpected
         );
     }
 }
